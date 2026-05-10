@@ -40,7 +40,7 @@ function basePaceMinPerKm(p: Profile): number {
   return Math.max(3.5, Math.min(9.0, pace));
 }
 
-function paceToBpm(paceMinPerKm: number): number {
+export function paceToBpm(paceMinPerKm: number): number {
   // Empirical: ~180 SPM at 4:30/km easing to ~158 SPM at 7:00/km
   const bpm = 200 - paceMinPerKm * 6;
   return Math.round(Math.max(140, Math.min(195, bpm)));
@@ -94,3 +94,144 @@ export const cmToIn = (cm: number) => cm / CM_PER_INCH;
 export const inToCm = (inches: number) => inches * CM_PER_INCH;
 export const kmToMi = (km: number) => km / KM_PER_MILE;
 export const miToKm = (mi: number) => mi * KM_PER_MILE;
+
+// ─── New feature types ────────────────────────────────────────────────────────
+
+export type PaceMode = "simple" | "workout" | "race";
+
+export interface RunSegment {
+  id: string;
+  targetBpm: number;
+  durationMin: number;
+  label: string;
+}
+
+export type SegmentPaceSource =
+  | { kind: "zone"; zoneId: PaceZone["id"] }
+  | { kind: "custom"; paceMinPerKm: number };
+
+export interface WorkoutSegmentDef {
+  id: string;
+  paceSource: SegmentPaceSource;
+  lengthMode: "duration" | "distance";
+  durationMin: number;
+  distanceMi: number;
+}
+
+export type RaceDistancePreset = "5k" | "10k" | "half" | "marathon" | "custom";
+export type RampMode = "even" | "negative" | "positive";
+
+export interface RaceConfig {
+  distancePreset: RaceDistancePreset;
+  customDistanceKm: number;
+  goalHours: number;
+  goalMinutes: number;
+  goalSeconds: number;
+  rampMode: RampMode;
+  rampIntensityPct: number;
+  numRaceSegments: number;
+}
+
+// ─── New feature functions ────────────────────────────────────────────────────
+
+export function formatPaceKm(minPerKm: number): string {
+  const m = Math.floor(minPerKm);
+  const s = Math.round((minPerKm - m) * 60);
+  return `${m}:${s.toString().padStart(2, "0")}/km`;
+}
+
+export function resolveWorkoutSegments(
+  defs: WorkoutSegmentDef[],
+  zones: PaceZone[],
+): RunSegment[] {
+  return defs.map((def) => {
+    let paceMinPerKm: number;
+    let label: string;
+    if (def.paceSource.kind === "zone") {
+      const src = def.paceSource;
+      const zone = zones.find((z) => z.id === src.zoneId) ?? zones[1];
+      paceMinPerKm = zone.paceMinPerKm;
+      label = zone.label;
+    } else {
+      paceMinPerKm = def.paceSource.paceMinPerKm;
+      label = `Custom ${paceToBpm(paceMinPerKm)} BPM`;
+    }
+    const durationMin =
+      def.lengthMode === "duration"
+        ? def.durationMin
+        : distanceToDurationMin(miToKm(def.distanceMi), paceMinPerKm);
+    return {
+      id: def.id,
+      targetBpm: paceToBpm(paceMinPerKm),
+      durationMin: Math.max(1, durationMin),
+      label,
+    };
+  });
+}
+
+const RACE_DISTANCE_KM: Record<RaceDistancePreset, number> = {
+  "5k": 5,
+  "10k": 10,
+  half: 21.0975,
+  marathon: 42.195,
+  custom: 0,
+};
+
+export function computeRaceSegments(config: RaceConfig): RunSegment[] {
+  const totalDistanceKm =
+    config.distancePreset === "custom"
+      ? config.customDistanceKm
+      : RACE_DISTANCE_KM[config.distancePreset];
+  const totalGoalMin =
+    config.goalHours * 60 + config.goalMinutes + config.goalSeconds / 60;
+  if (totalGoalMin === 0 || totalDistanceKm === 0) return [];
+
+  const avgPace = totalGoalMin / totalDistanceKm;
+  const avgBpm = paceToBpm(avgPace);
+
+  if (config.rampMode === "even" || config.numRaceSegments <= 1) {
+    return [{ id: "race-0", targetBpm: avgBpm, durationMin: totalGoalMin, label: "Race Pace" }];
+  }
+
+  const spread = avgBpm * (config.rampIntensityPct / 100);
+  const [startBpm, endBpm] =
+    config.rampMode === "negative"
+      ? [avgBpm - spread / 2, avgBpm + spread / 2]
+      : [avgBpm + spread / 2, avgBpm - spread / 2];
+
+  const n = config.numRaceSegments;
+  const segDuration = totalGoalMin / n;
+  const segDistKm = totalDistanceKm / n;
+
+  return Array.from({ length: n }, (_, i) => {
+    const bpm =
+      n === 1
+        ? avgBpm
+        : Math.round(startBpm + ((endBpm - startBpm) * i) / (n - 1));
+    const startMi = kmToMi(segDistKm * i);
+    const endMi = kmToMi(segDistKm * (i + 1));
+    return {
+      id: `race-${i}`,
+      targetBpm: Math.round(Math.max(140, Math.min(195, bpm))),
+      durationMin: segDuration,
+      label: `Mi ${startMi.toFixed(1)}–${endMi.toFixed(1)}`,
+    };
+  });
+}
+
+export function formatGoalPace(
+  config: RaceConfig,
+): { minPerKm: string; minPerMi: string } | null {
+  const totalGoalMin =
+    config.goalHours * 60 + config.goalMinutes + config.goalSeconds / 60;
+  const totalDistanceKm =
+    config.distancePreset === "custom"
+      ? config.customDistanceKm
+      : RACE_DISTANCE_KM[config.distancePreset];
+  if (totalGoalMin === 0 || totalDistanceKm === 0) return null;
+  const paceMinPerKm = totalGoalMin / totalDistanceKm;
+  return {
+    minPerKm: formatPaceKm(paceMinPerKm),
+    minPerMi: formatPace(paceMinPerKm),
+  };
+}

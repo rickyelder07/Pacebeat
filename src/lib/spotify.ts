@@ -401,11 +401,12 @@ function extractPlaylistTotal(value: unknown): number {
 async function hydratePlaylistTotals(playlists: SpotifyPlaylist[]): Promise<SpotifyPlaylist[]> {
   return Promise.all(
     playlists.map(async (playlist) => {
+      if (playlist.tracks.total > 0) return playlist;
       try {
-        const r = await api<{ tracks?: { total?: number } }>(`/playlists/${playlist.id}?fields=tracks(total)`);
+        const r = await api<{ total?: number }>(`/playlists/${playlist.id}/items?limit=1`);
         return {
           ...playlist,
-          tracks: { total: typeof r.tracks?.total === "number" ? r.tracks.total : playlist.tracks.total },
+          tracks: { total: typeof r.total === "number" ? r.total : playlist.tracks.total },
         };
       } catch {
         return playlist;
@@ -438,7 +439,7 @@ export async function getMyPlaylists(max = 50): Promise<SpotifyPlaylist[]> {
     url = r.next ? r.next.replace("https://api.spotify.com/v1", "") : null;
   }
   const playlists = out.slice(0, max);
-  if (playlists.length > 0 && playlists.every((playlist) => playlist.tracks.total === 0)) {
+  if (playlists.some((playlist) => playlist.tracks.total === 0)) {
     return hydratePlaylistTotals(playlists);
   }
   return playlists;
@@ -531,72 +532,59 @@ async function hydrateTracksByIds(ids: string[]): Promise<SpotifyTrack[]> {
 }
 
 export async function getPlaylistTracks(playlistId: string, max = 200): Promise<SpotifyTrack[]> {
-  const readFrom = async (initialUrl: string): Promise<{
-    tracks: SpotifyTrack[];
-    itemCount: number;
-    total: number | null;
-  }> => {
-    const out = new Map<string, SpotifyTrack>();
-    const missingIds = new Set<string>();
-    let itemCount = 0;
-    let total: number | null = null;
-    let url: string | null = initialUrl;
-    while (url && out.size < max) {
-      const r: {
-        items?: unknown[];
+  const seen = new Set<string>();
+  const out: SpotifyTrack[] = [];
+
+  // Primary: /items endpoint, same simple pattern as getMyLikedTracks
+  try {
+    let url: string | null = `/playlists/${playlistId}/items?limit=100&additional_types=track`;
+    while (url && out.length < max) {
+      const r = await api<{
+        items?: Array<{ track?: SpotifyTrack | null; item?: SpotifyTrack | null; is_local?: boolean } | null>;
         next?: string | null;
         total?: number;
-        tracks?: { items?: unknown[]; next?: string | null; total?: number };
-      } = await api(url);
-      const pageItems = r.items ?? r.tracks?.items ?? [];
-      itemCount += pageItems.length;
-      if (typeof r.total === "number") total = r.total;
-      if (typeof r.tracks?.total === "number") total = r.tracks.total;
-      for (const item of pageItems) {
-        const track = extractPlaylistTrack(item);
-        if (track) {
-          out.set(track.id, track);
-          continue;
+      }>(url);
+      console.log("[getPlaylistTracks] primary page:", { total: r.total, itemCount: r.items?.length, firstItem: r.items?.[0] });
+      for (const item of r.items ?? []) {
+        const track = (item?.track ?? item?.item) as SpotifyTrack | null | undefined;
+        if (track && track.id && !item?.is_local && !seen.has(track.id)) {
+          seen.add(track.id);
+          out.push(track);
         }
-        const id = extractTrackId(item);
-        if (id && !out.has(id)) missingIds.add(id);
       }
-      const next = r.next ?? r.tracks?.next ?? null;
-      url = next ? next.replace("https://api.spotify.com/v1", "") : null;
+      url = r.next ? r.next.replace("https://api.spotify.com/v1", "") : null;
     }
-    if (out.size < max && missingIds.size > 0) {
-      const hydrated = await hydrateTracksByIds(Array.from(missingIds).slice(0, max - out.size));
-      for (const track of hydrated) out.set(track.id, track);
-    }
-    return {
-      tracks: Array.from(out.values()).slice(0, max),
-      itemCount,
-      total,
-    };
-  };
-
-  const candidates = [
-    `/playlists/${playlistId}/items?limit=100&market=from_token&additional_types=track`,
-    `/playlists/${playlistId}?market=from_token&fields=tracks.total,tracks.items(track(id,name,uri,duration_ms,preview_url,is_local,external_ids,linked_from(id),artists(id,name),album(name,images))),tracks.next`,
-    `/playlists/${playlistId}/items?limit=100&additional_types=track`,
-    `/playlists/${playlistId}?fields=tracks.total,tracks.items(track(id,name,uri,duration_ms,preview_url,is_local,external_ids,linked_from(id),artists(id,name),album(name,images))),tracks.next`,
-  ];
-
-  let lastError: unknown = null;
-  for (const candidate of candidates) {
-    try {
-      const result = await readFrom(candidate);
-      if (result.tracks.length > 0) return result.tracks;
-      if (result.itemCount > 0) return result.tracks;
-      if (result.total === 0) return [];
-    } catch (error) {
-      lastError = error;
-      continue;
-    }
+    console.log("[getPlaylistTracks] primary result:", out.length, "tracks");
+    if (out.length > 0) return out;
+  } catch (e) {
+    console.error("[getPlaylistTracks] primary failed:", e);
   }
 
-  if (lastError) throw lastError instanceof Error ? lastError : new Error(String(lastError));
-  return [];
+  // Fallback: fields-filtered playlist object (older clients / edge cases)
+  out.length = 0;
+  seen.clear();
+  console.log("[getPlaylistTracks] trying fallback for playlist:", playlistId);
+  let url: string | null = `/playlists/${playlistId}?fields=tracks.total,tracks.items(track(id,name,uri,duration_ms,preview_url,is_local,external_ids,linked_from(id),artists(id,name),album(name,images))),tracks.next`;
+  while (url && out.length < max) {
+    const r = await api<{
+      tracks?: {
+        items?: Array<{ track?: SpotifyTrack | null } | null>;
+        next?: string | null;
+        total?: number;
+      };
+    }>(url);
+    console.log("[getPlaylistTracks] fallback page:", { total: r.tracks?.total, itemCount: r.tracks?.items?.length, firstItem: r.tracks?.items?.[0] });
+    for (const item of r.tracks?.items ?? []) {
+      const track = item?.track;
+      if (track && track.id && !track.is_local && !seen.has(track.id)) {
+        seen.add(track.id);
+        out.push(track);
+      }
+    }
+    url = r.tracks?.next ? r.tracks.next.replace("https://api.spotify.com/v1", "") : null;
+  }
+  console.log("[getPlaylistTracks] fallback result:", out.length, "tracks");
+  return out;
 }
 
 export async function getMyLikedTracks(max = 200): Promise<SpotifyTrack[]> {

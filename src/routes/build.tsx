@@ -2,17 +2,29 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   computeZones,
+  distanceToDurationMin,
   formatPace,
+  formatPaceKm,
+  formatGoalPace,
   kgToLb,
   lbToKg,
   cmToIn,
   inToCm,
   kmToMi,
   miToKm,
+  paceToBpm,
+  resolveWorkoutSegments,
+  computeRaceSegments,
   type Fitness,
+  type PaceMode,
   type PaceZone,
   type Profile,
+  type RaceConfig,
+  type RampMode,
+  type RaceDistancePreset,
+  type RunSegment,
   type Sex,
+  type WorkoutSegmentDef,
 } from "@/lib/pace";
 import {
   getMe,
@@ -27,7 +39,7 @@ import {
   type SpotifyTrack,
   type SpotifyUser,
 } from "@/lib/spotify";
-import { analyzeTracks, pickForRun, totalMinutes, type AnalyzedTrack } from "@/lib/bpm";
+import { analyzeTracks, pickForSegments, totalMinutes, type AnalyzedTrack } from "@/lib/bpm";
 import { useRequireAuth } from "@/hooks/use-auth";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
@@ -38,7 +50,34 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Slider } from "@/components/ui/slider";
 import { Progress } from "@/components/ui/progress";
-import { Activity, Gauge, Music, ArrowRight, Loader2, ExternalLink, Search, Wand2 } from "lucide-react";
+import {
+  Activity,
+  ArrowRight,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+  Flag,
+  Gauge,
+  Loader2,
+  Music,
+  RefreshCw,
+  Search,
+  Shuffle,
+  Timer,
+  Trash2,
+  Wand2,
+} from "lucide-react";
+
+function fmtTime(ms: number): string {
+  const totalSec = Math.round(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function fmtMs(ms: number): string {
+  return fmtTime(ms);
+}
 
 export const Route = createFileRoute("/build")({
   component: Build,
@@ -92,6 +131,27 @@ function Build() {
   const [tolerance, setTolerance] = useState(5);
   const [source, setSource] = useState<Source | null>(null);
 
+  const [paceMode, setPaceMode] = useState<PaceMode>("simple");
+  const [workoutSegments, setWorkoutSegments] = useState<WorkoutSegmentDef[]>([
+    {
+      id: crypto.randomUUID(),
+      paceSource: { kind: "zone", zoneId: "easy" },
+      lengthMode: "duration",
+      durationMin: 30,
+      distanceMi: 3,
+    },
+  ]);
+  const [raceConfig, setRaceConfig] = useState<RaceConfig>({
+    distancePreset: "5k",
+    customDistanceKm: 10,
+    goalHours: 0,
+    goalMinutes: 25,
+    goalSeconds: 0,
+    rampMode: "even",
+    rampIntensityPct: 5,
+    numRaceSegments: 4,
+  });
+
   useEffect(() => {
     if (authed && !me && !meLoading) loadMe();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -99,8 +159,44 @@ function Build() {
 
   const zones = useMemo(() => computeZones(profile), [profile]);
 
-  const targetMinutes =
-    lengthMode === "duration" ? durationMin : (zone ? distanceKm * zone.paceMinPerKm : distanceKm * 6);
+  const segments = useMemo((): RunSegment[] => {
+    if (paceMode === "simple" && zone) {
+      const dmin =
+        lengthMode === "duration"
+          ? durationMin
+          : distanceToDurationMin(distanceKm, zone.paceMinPerKm);
+      return [{ id: "simple", targetBpm: zone.bpm, durationMin: dmin, label: zone.label }];
+    }
+    if (paceMode === "workout") return resolveWorkoutSegments(workoutSegments, zones);
+    if (paceMode === "race") return computeRaceSegments(raceConfig);
+    return [];
+  }, [paceMode, zone, lengthMode, durationMin, distanceKm, workoutSegments, raceConfig, zones]);
+
+  const moveSegment = (id: string, dir: -1 | 1) =>
+    setWorkoutSegments((prev) => {
+      const idx = prev.findIndex((s) => s.id === id);
+      if (idx < 0) return prev;
+      const next = [...prev];
+      const swap = idx + dir;
+      if (swap < 0 || swap >= next.length) return prev;
+      [next[idx], next[swap]] = [next[swap], next[idx]];
+      return next;
+    });
+  const deleteSegment = (id: string) =>
+    setWorkoutSegments((prev) => prev.filter((s) => s.id !== id));
+  const updateSegment = (id: string, patch: Partial<WorkoutSegmentDef>) =>
+    setWorkoutSegments((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  const addSegment = () =>
+    setWorkoutSegments((prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        paceSource: { kind: "zone", zoneId: "easy" },
+        lengthMode: "duration",
+        durationMin: 20,
+        distanceMi: 2,
+      },
+    ]);
 
   if (!authed) return null;
 
@@ -130,6 +226,16 @@ function Build() {
               setDistanceKm={setDistanceKm}
               tolerance={tolerance}
               setTolerance={setTolerance}
+              paceMode={paceMode}
+              setPaceMode={setPaceMode}
+              workoutSegments={workoutSegments}
+              onAddSegment={addSegment}
+              onUpdateSegment={updateSegment}
+              onMoveSegment={moveSegment}
+              onDeleteSegment={deleteSegment}
+              raceConfig={raceConfig}
+              setRaceConfig={setRaceConfig}
+              segments={segments}
               onBack={() => setStep("profile")}
               onNext={() => setStep("source")}
             />
@@ -144,12 +250,11 @@ function Build() {
             />
           )}
           {step === "generate" && (
-            zone && source && me ? (
+            segments.length > 0 && source && me ? (
               <GenerateStep
                 me={me}
-                zone={zone}
+                segments={segments}
                 source={source}
-                targetMinutes={targetMinutes}
                 tolerance={tolerance}
                 onRestart={() => setStep("pace")}
               />
@@ -162,7 +267,7 @@ function Build() {
                       ? meError
                         ? "Couldn't load your Spotify profile."
                         : "Loading your Spotify profile. If this takes more than a few seconds, reconnect Spotify."
-                      : !zone
+                      : segments.length === 0
                       ? "No pace selected — go back and pick one."
                       : "No music source selected — go back and pick one."}
                   </CardDescription>
@@ -348,6 +453,449 @@ function PillRadio({ value, current, label }: { value: string; current: string; 
   );
 }
 
+function ZoneGrid({
+  zones,
+  selected,
+  onSelect,
+}: {
+  zones: PaceZone[];
+  selected: PaceZone | null;
+  onSelect: (z: PaceZone) => void;
+}) {
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      {zones.map((z) => {
+        const active = selected?.id === z.id;
+        return (
+          <button
+            key={z.id}
+            onClick={() => onSelect(z)}
+            className={`group rounded-xl border p-4 text-left transition-all ${
+              active
+                ? "border-primary bg-primary/10 glow"
+                : "border-border hover:border-primary/40 hover:bg-surface/40"
+            }`}
+          >
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="font-display text-lg font-semibold">{z.label}</div>
+                <div className="text-xs text-muted-foreground">{z.description}</div>
+              </div>
+              <div className="text-right">
+                <div className="font-mono text-xl text-primary">{z.bpm}</div>
+                <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">bpm</div>
+              </div>
+            </div>
+            <div className="mt-3 font-mono text-sm">{formatPace(z.paceMinPerKm)}</div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function LengthPicker({
+  zones,
+  selected,
+  lengthMode,
+  setLengthMode,
+  durationMin,
+  setDurationMin,
+  distanceKm,
+  setDistanceKm,
+}: {
+  zones: PaceZone[];
+  selected: PaceZone | null;
+  lengthMode: "duration" | "distance";
+  setLengthMode: (m: "duration" | "distance") => void;
+  durationMin: number;
+  setDurationMin: (n: number) => void;
+  distanceKm: number;
+  setDistanceKm: (n: number) => void;
+}) {
+  return (
+    <div className="space-y-3 rounded-xl border border-border bg-surface/40 p-4">
+      <Tabs value={lengthMode} onValueChange={(v) => setLengthMode(v as "duration" | "distance")}>
+        <TabsList className="grid w-full grid-cols-2">
+          <TabsTrigger value="duration">By duration</TabsTrigger>
+          <TabsTrigger value="distance">By distance</TabsTrigger>
+        </TabsList>
+        <TabsContent value="duration" className="mt-4 space-y-3">
+          <div className="flex items-baseline justify-between">
+            <Label>Run length</Label>
+            <span className="font-mono text-lg text-primary">{durationMin} min</span>
+          </div>
+          <Slider min={10} max={120} step={5} value={[durationMin]} onValueChange={(v) => setDurationMin(v[0])} />
+        </TabsContent>
+        <TabsContent value="distance" className="mt-4 space-y-3">
+          <div className="flex items-baseline justify-between">
+            <Label>Distance</Label>
+            <span className="font-mono text-lg text-primary">{kmToMi(distanceKm).toFixed(1)} mi</span>
+          </div>
+          <Slider
+            min={1}
+            max={26}
+            step={1}
+            value={[Math.round(kmToMi(distanceKm))]}
+            onValueChange={(v) => setDistanceKm(miToKm(v[0]))}
+          />
+          {selected && (
+            <div className="font-mono text-xs text-muted-foreground">
+              ≈ {Math.round(distanceKm * selected.paceMinPerKm)} min at {formatPace(selected.paceMinPerKm)}
+            </div>
+          )}
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}
+
+function WorkoutSegmentRow({
+  index,
+  def,
+  total,
+  zones,
+  onChange,
+  onMoveUp,
+  onMoveDown,
+  onDelete,
+}: {
+  index: number;
+  def: WorkoutSegmentDef;
+  total: number;
+  zones: PaceZone[];
+  onChange: (id: string, patch: Partial<WorkoutSegmentDef>) => void;
+  onMoveUp: (id: string) => void;
+  onMoveDown: (id: string) => void;
+  onDelete: (id: string) => void;
+}) {
+  const [customPaceStr, setCustomPaceStr] = useState(
+    def.paceSource.kind === "custom" ? def.paceSource.paceMinPerKm.toFixed(2) : "6.00",
+  );
+
+  function parseCustomPace(s: string): number | null {
+    // Accept "M:SS" or plain decimal like "5.5"
+    const colonMatch = s.match(/^(\d+):(\d{1,2})$/);
+    if (colonMatch) {
+      const m = parseInt(colonMatch[1], 10);
+      const sec = parseInt(colonMatch[2], 10);
+      if (sec < 60) return m + sec / 60;
+    }
+    const n = parseFloat(s);
+    return isNaN(n) || n <= 0 ? null : n;
+  }
+
+  const customBpm =
+    def.paceSource.kind === "custom"
+      ? paceToBpm(def.paceSource.paceMinPerKm)
+      : null;
+
+  return (
+    <div className="rounded-xl border border-border bg-surface/40 p-4 space-y-4">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-xs text-muted-foreground uppercase tracking-widest">
+          Segment {index + 1}
+        </span>
+        <div className="flex gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            onClick={() => onMoveUp(def.id)}
+            disabled={index === 0}
+          >
+            <ChevronUp className="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            onClick={() => onMoveDown(def.id)}
+            disabled={index === total - 1}
+          >
+            <ChevronDown className="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7 text-destructive hover:text-destructive"
+            onClick={() => onDelete(def.id)}
+            disabled={total === 1}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      </div>
+
+      {/* Pace source */}
+      <div className="space-y-2">
+        <Label className="text-xs">Pace zone</Label>
+        <div className="flex flex-wrap gap-2">
+          {zones.map((z) => {
+            const active = def.paceSource.kind === "zone" && def.paceSource.zoneId === z.id;
+            return (
+              <button
+                key={z.id}
+                onClick={() => onChange(def.id, { paceSource: { kind: "zone", zoneId: z.id } })}
+                className={`rounded-md border px-3 py-1.5 text-xs transition-colors ${
+                  active
+                    ? "border-primary bg-primary/10 text-primary"
+                    : "border-border hover:border-foreground/30"
+                }`}
+              >
+                {z.label}
+                <span className="ml-1.5 font-mono text-[10px] opacity-70">{z.bpm}</span>
+              </button>
+            );
+          })}
+          <button
+            onClick={() =>
+              onChange(def.id, {
+                paceSource: { kind: "custom", paceMinPerKm: parseCustomPace(customPaceStr) ?? 6 },
+              })
+            }
+            className={`rounded-md border px-3 py-1.5 text-xs transition-colors ${
+              def.paceSource.kind === "custom"
+                ? "border-primary bg-primary/10 text-primary"
+                : "border-border hover:border-foreground/30"
+            }`}
+          >
+            Custom
+          </button>
+        </div>
+        {def.paceSource.kind === "custom" && (
+          <div className="flex items-center gap-3 mt-2">
+            <Input
+              className="font-mono w-28 h-8 text-sm"
+              placeholder="5:30"
+              value={customPaceStr}
+              onChange={(e) => {
+                setCustomPaceStr(e.target.value);
+                const p = parseCustomPace(e.target.value);
+                if (p) onChange(def.id, { paceSource: { kind: "custom", paceMinPerKm: p } });
+              }}
+            />
+            <span className="text-xs text-muted-foreground">/km</span>
+            {customBpm !== null && (
+              <span className="font-mono text-xs text-primary">= {customBpm} BPM</span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Length */}
+      <div className="space-y-2">
+        <Tabs
+          value={def.lengthMode}
+          onValueChange={(v) => onChange(def.id, { lengthMode: v as "duration" | "distance" })}
+        >
+          <TabsList className="grid w-full grid-cols-2 h-8">
+            <TabsTrigger value="duration" className="text-xs">Duration</TabsTrigger>
+            <TabsTrigger value="distance" className="text-xs">Distance</TabsTrigger>
+          </TabsList>
+          <TabsContent value="duration" className="mt-3 space-y-2">
+            <div className="flex items-baseline justify-between">
+              <Label className="text-xs">Length</Label>
+              <span className="font-mono text-sm text-primary">{def.durationMin} min</span>
+            </div>
+            <Slider
+              min={5}
+              max={60}
+              step={5}
+              value={[def.durationMin]}
+              onValueChange={(v) => onChange(def.id, { durationMin: v[0] })}
+            />
+          </TabsContent>
+          <TabsContent value="distance" className="mt-3 space-y-2">
+            <div className="flex items-baseline justify-between">
+              <Label className="text-xs">Distance</Label>
+              <span className="font-mono text-sm text-primary">{def.distanceMi.toFixed(1)} mi</span>
+            </div>
+            <Slider
+              min={0.5}
+              max={20}
+              step={0.5}
+              value={[def.distanceMi]}
+              onValueChange={(v) => onChange(def.id, { distanceMi: v[0] })}
+            />
+          </TabsContent>
+        </Tabs>
+      </div>
+    </div>
+  );
+}
+
+const RACE_PRESETS: { id: RaceDistancePreset; label: string }[] = [
+  { id: "5k", label: "5K" },
+  { id: "10k", label: "10K" },
+  { id: "half", label: "Half" },
+  { id: "marathon", label: "Marathon" },
+  { id: "custom", label: "Custom" },
+];
+
+const RAMP_OPTIONS: { value: RampMode; label: string; desc: string }[] = [
+  { value: "even", label: "Even Pace", desc: "Same BPM throughout" },
+  { value: "negative", label: "Negative Split", desc: "Speed up as you go" },
+  { value: "positive", label: "Positive Split", desc: "Start fast, ease off" },
+];
+
+function RacePacePanel({
+  config,
+  onChange,
+  segments,
+}: {
+  config: RaceConfig;
+  onChange: (c: RaceConfig) => void;
+  segments: RunSegment[];
+}) {
+  const pace = formatGoalPace(config);
+  return (
+    <div className="space-y-5">
+      {/* Distance preset */}
+      <div className="space-y-2">
+        <Label>Race distance</Label>
+        <div className="flex flex-wrap gap-2">
+          {RACE_PRESETS.map((p) => (
+            <button
+              key={p.id}
+              onClick={() => onChange({ ...config, distancePreset: p.id })}
+              className={`rounded-md border px-4 py-2 text-sm transition-colors ${
+                config.distancePreset === p.id
+                  ? "border-primary bg-primary/10 text-primary"
+                  : "border-border hover:border-foreground/30"
+              }`}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        {config.distancePreset === "custom" && (
+          <div className="flex items-center gap-2 mt-2">
+            <Input
+              type="number"
+              min={1}
+              max={200}
+              className="font-mono w-24 h-8 text-sm"
+              value={config.customDistanceKm}
+              onChange={(e) => onChange({ ...config, customDistanceKm: Number(e.target.value) || 10 })}
+            />
+            <span className="text-xs text-muted-foreground">km</span>
+          </div>
+        )}
+      </div>
+
+      {/* Goal time */}
+      <div className="space-y-2">
+        <Label>Goal finish time</Label>
+        <div className="flex items-center gap-2">
+          <Input
+            type="number"
+            min={0}
+            max={9}
+            className="font-mono w-16 h-8 text-sm text-center"
+            value={config.goalHours}
+            onChange={(e) => onChange({ ...config, goalHours: Math.min(9, Math.max(0, Number(e.target.value) || 0)) })}
+          />
+          <span className="text-muted-foreground text-sm">h</span>
+          <Input
+            type="number"
+            min={0}
+            max={59}
+            className="font-mono w-16 h-8 text-sm text-center"
+            value={config.goalMinutes}
+            onChange={(e) => onChange({ ...config, goalMinutes: Math.min(59, Math.max(0, Number(e.target.value) || 0)) })}
+          />
+          <span className="text-muted-foreground text-sm">m</span>
+          <Input
+            type="number"
+            min={0}
+            max={59}
+            className="font-mono w-16 h-8 text-sm text-center"
+            value={config.goalSeconds}
+            onChange={(e) => onChange({ ...config, goalSeconds: Math.min(59, Math.max(0, Number(e.target.value) || 0)) })}
+          />
+          <span className="text-muted-foreground text-sm">s</span>
+        </div>
+        {pace ? (
+          <div className="font-mono text-sm text-primary">
+            {pace.minPerMi} · {pace.minPerKm}
+          </div>
+        ) : (
+          <div className="text-xs text-muted-foreground">Enter a goal time to see your target pace</div>
+        )}
+      </div>
+
+      {/* Ramp mode */}
+      <div className="space-y-2">
+        <Label>Pacing strategy</Label>
+        <div className="flex flex-wrap gap-2">
+          {RAMP_OPTIONS.map((r) => (
+            <button
+              key={r.value}
+              onClick={() => onChange({ ...config, rampMode: r.value })}
+              className={`rounded-md border px-3 py-2 text-left text-sm transition-colors ${
+                config.rampMode === r.value
+                  ? "border-primary bg-primary/10 text-primary"
+                  : "border-border hover:border-foreground/30"
+              }`}
+            >
+              <div className="font-medium">{r.label}</div>
+              <div className="text-[11px] opacity-70">{r.desc}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Ramp controls */}
+      {config.rampMode !== "even" && (
+        <div className="space-y-4 rounded-xl border border-border bg-surface/40 p-4">
+          <div className="space-y-2">
+            <div className="flex items-baseline justify-between">
+              <Label>BPM spread</Label>
+              <span className="font-mono text-sm text-primary">±{config.rampIntensityPct}%</span>
+            </div>
+            <Slider
+              min={1}
+              max={10}
+              step={1}
+              value={[config.rampIntensityPct]}
+              onValueChange={(v) => onChange({ ...config, rampIntensityPct: v[0] })}
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-baseline justify-between">
+              <Label>Music segments</Label>
+              <span className="font-mono text-sm text-primary">{config.numRaceSegments}</span>
+            </div>
+            <Slider
+              min={3}
+              max={8}
+              step={1}
+              value={[config.numRaceSegments]}
+              onValueChange={(v) => onChange({ ...config, numRaceSegments: v[0] })}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Segment preview */}
+      {segments.length > 0 && (
+        <div className="space-y-1.5">
+          <Label className="text-xs">Segment breakdown</Label>
+          <div className="space-y-1 rounded-lg border border-border divide-y divide-border/50">
+            {segments.map((s) => (
+              <div key={s.id} className="flex items-center justify-between px-3 py-2 text-xs">
+                <span className="text-muted-foreground">{s.label}</span>
+                <span className="font-mono text-primary">{s.targetBpm} BPM · {Math.round(s.durationMin)} min</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PaceStep({
   zones,
   selected,
@@ -360,6 +908,16 @@ function PaceStep({
   setDistanceKm,
   tolerance,
   setTolerance,
+  paceMode,
+  setPaceMode,
+  workoutSegments,
+  onAddSegment,
+  onUpdateSegment,
+  onMoveSegment,
+  onDeleteSegment,
+  raceConfig,
+  setRaceConfig,
+  segments,
   onBack,
   onNext,
 }: {
@@ -374,79 +932,96 @@ function PaceStep({
   setDistanceKm: (n: number) => void;
   tolerance: number;
   setTolerance: (n: number) => void;
+  paceMode: PaceMode;
+  setPaceMode: (m: PaceMode) => void;
+  workoutSegments: WorkoutSegmentDef[];
+  onAddSegment: () => void;
+  onUpdateSegment: (id: string, patch: Partial<WorkoutSegmentDef>) => void;
+  onMoveSegment: (id: string, dir: -1 | 1) => void;
+  onDeleteSegment: (id: string) => void;
+  raceConfig: RaceConfig;
+  setRaceConfig: (c: RaceConfig) => void;
+  segments: RunSegment[];
   onBack: () => void;
   onNext: () => void;
 }) {
+  const canProceed =
+    paceMode === "simple"
+      ? selected !== null
+      : paceMode === "workout"
+      ? segments.length > 0 && segments.every((s) => s.durationMin > 0)
+      : segments.length > 0;
+
+  const totalWorkoutMin = segments.reduce((s, seg) => s + seg.durationMin, 0);
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="font-display text-2xl">Pick your pace</CardTitle>
-        <CardDescription>Zones are estimated from your profile.</CardDescription>
+        <CardTitle className="font-display text-2xl">Configure your run</CardTitle>
+        <CardDescription>Choose a run style and set your pace.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
-        <div className="grid gap-3 sm:grid-cols-2">
-          {zones.map((z) => {
-            const active = selected?.id === z.id;
-            return (
-              <button
-                key={z.id}
-                onClick={() => onSelect(z)}
-                className={`group rounded-xl border p-4 text-left transition-all ${
-                  active
-                    ? "border-primary bg-primary/10 glow"
-                    : "border-border hover:border-primary/40 hover:bg-surface/40"
-                }`}
-              >
-                <div className="flex items-start justify-between">
-                  <div>
-                    <div className="font-display text-lg font-semibold">{z.label}</div>
-                    <div className="text-xs text-muted-foreground">{z.description}</div>
-                  </div>
-                  <div className="text-right">
-                    <div className="font-mono text-xl text-primary">{z.bpm}</div>
-                    <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">bpm</div>
-                  </div>
-                </div>
-                <div className="mt-3 font-mono text-sm">{formatPace(z.paceMinPerKm)}</div>
-              </button>
-            );
-          })}
-        </div>
+        <Tabs value={paceMode} onValueChange={(v) => setPaceMode(v as PaceMode)}>
+          <TabsList className="grid w-full grid-cols-3">
+            <TabsTrigger value="simple" className="gap-1.5">
+              <Activity className="h-3.5 w-3.5" /> Quick Run
+            </TabsTrigger>
+            <TabsTrigger value="workout" className="gap-1.5">
+              <Timer className="h-3.5 w-3.5" /> Workout
+            </TabsTrigger>
+            <TabsTrigger value="race" className="gap-1.5">
+              <Flag className="h-3.5 w-3.5" /> Race Pace
+            </TabsTrigger>
+          </TabsList>
 
-        <div className="space-y-3 rounded-xl border border-border bg-surface/40 p-4">
-          <Tabs value={lengthMode} onValueChange={(v) => setLengthMode(v as "duration" | "distance")}>
-            <TabsList className="grid w-full grid-cols-2">
-              <TabsTrigger value="duration">By duration</TabsTrigger>
-              <TabsTrigger value="distance">By distance</TabsTrigger>
-            </TabsList>
-            <TabsContent value="duration" className="mt-4 space-y-3">
-              <div className="flex items-baseline justify-between">
-                <Label>Run length</Label>
-                <span className="font-mono text-lg text-primary">{durationMin} min</span>
-              </div>
-              <Slider min={10} max={120} step={5} value={[durationMin]} onValueChange={(v) => setDurationMin(v[0])} />
-            </TabsContent>
-            <TabsContent value="distance" className="mt-4 space-y-3">
-              <div className="flex items-baseline justify-between">
-                <Label>Distance</Label>
-                <span className="font-mono text-lg text-primary">{kmToMi(distanceKm).toFixed(1)} mi</span>
-              </div>
-              <Slider
-                min={1}
-                max={26}
-                step={1}
-                value={[Math.round(kmToMi(distanceKm))]}
-                onValueChange={(v) => setDistanceKm(miToKm(v[0]))}
+          {/* ── Simple tab ── */}
+          <TabsContent value="simple" className="mt-6 space-y-6">
+            <ZoneGrid zones={zones} selected={selected} onSelect={onSelect} />
+            <LengthPicker
+              zones={zones}
+              selected={selected}
+              lengthMode={lengthMode}
+              setLengthMode={setLengthMode}
+              durationMin={durationMin}
+              setDurationMin={setDurationMin}
+              distanceKm={distanceKm}
+              setDistanceKm={setDistanceKm}
+            />
+          </TabsContent>
+
+          {/* ── Workout tab ── */}
+          <TabsContent value="workout" className="mt-6 space-y-4">
+            {workoutSegments.map((def, i) => (
+              <WorkoutSegmentRow
+                key={def.id}
+                index={i}
+                def={def}
+                total={workoutSegments.length}
+                zones={zones}
+                onChange={onUpdateSegment}
+                onMoveUp={(id) => onMoveSegment(id, -1)}
+                onMoveDown={(id) => onMoveSegment(id, 1)}
+                onDelete={onDeleteSegment}
               />
-              {selected && (
-                <div className="font-mono text-xs text-muted-foreground">
-                  ≈ {Math.round(distanceKm * selected.paceMinPerKm)} min at {formatPace(selected.paceMinPerKm)}
-                </div>
-              )}
-            </TabsContent>
-          </Tabs>
-        </div>
+            ))}
+            <Button variant="outline" className="w-full" onClick={onAddSegment}>
+              + Add Segment
+            </Button>
+            {segments.length > 0 && (
+              <div className="rounded-lg border border-border/50 bg-surface/20 px-4 py-2 text-xs text-muted-foreground">
+                Total: <span className="font-mono text-foreground">{Math.round(totalWorkoutMin)} min</span> across{" "}
+                <span className="font-mono text-foreground">{segments.length}</span> segments
+              </div>
+            )}
+          </TabsContent>
 
+          {/* ── Race tab ── */}
+          <TabsContent value="race" className="mt-6">
+            <RacePacePanel config={raceConfig} onChange={setRaceConfig} segments={segments} />
+          </TabsContent>
+        </Tabs>
+
+        {/* BPM Tolerance — shared across all modes */}
         <div className="space-y-3 rounded-xl border border-border bg-surface/40 p-4">
           <div className="flex items-baseline justify-between">
             <Label>BPM tolerance</Label>
@@ -460,7 +1035,7 @@ function PaceStep({
 
         <div className="flex justify-between">
           <Button variant="ghost" onClick={onBack}>Back</Button>
-          <Button onClick={onNext} disabled={!selected} variant="hero" size="lg">
+          <Button onClick={onNext} disabled={!canProceed} variant="hero" size="lg">
             Next: pick music <ArrowRight className="h-4 w-4" />
           </Button>
         </div>
@@ -595,16 +1170,14 @@ function SourceStep({
 
 function GenerateStep({
   me,
-  zone,
+  segments,
   source,
-  targetMinutes,
   tolerance,
   onRestart,
 }: {
   me: SpotifyUser;
-  zone: PaceZone;
+  segments: RunSegment[];
   source: Source;
-  targetMinutes: number;
   tolerance: number;
   onRestart: () => void;
 }) {
@@ -612,10 +1185,13 @@ function GenerateStep({
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [analyzed, setAnalyzed] = useState<AnalyzedTrack[]>([]);
   const [picked, setPicked] = useState<AnalyzedTrack[]>([]);
+  const [segmentSizes, setSegmentSizes] = useState<number[]>([]);
   const [playlistUrl, setPlaylistUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
 
   const sourceLabel = source.kind === "liked" ? "Liked Songs" : source.name;
+  const isMultiSegment = segments.length > 1;
+  const totalTargetMin = segments.reduce((s, seg) => s + seg.durationMin, 0);
 
   useEffect(() => {
     let cancelled = false;
@@ -626,7 +1202,6 @@ function GenerateStep({
           ? await getMyLikedTracks(1000)
           : await getPlaylistTracks(source.id, 1000);
         if (cancelled) return;
-        // dedupe by id
         const map = new Map<string, SpotifyTrack>();
         pool.forEach((t) => t && map.set(t.id, t));
         const deduped = Array.from(map.values());
@@ -637,8 +1212,9 @@ function GenerateStep({
         }, 4);
         if (cancelled) return;
         setAnalyzed(results);
-        const chosen = pickForRun(results, zone.bpm, tolerance, targetMinutes);
+        const { tracks: chosen, segmentSizes: sizes } = pickForSegments(results, segments, tolerance);
         setPicked(chosen);
+        setSegmentSizes(sizes);
         setPhase("ready");
       } catch (e) {
         if (cancelled) return;
@@ -650,11 +1226,67 @@ function GenerateStep({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  function getSegmentForIndex(trackIdx: number): number {
+    let count = 0;
+    for (let s = 0; s < segmentSizes.length; s++) {
+      count += segmentSizes[s];
+      if (trackIdx < count) return s;
+    }
+    return Math.max(0, segmentSizes.length - 1);
+  }
+
+  function getSegmentBounds(segIdx: number): [number, number] {
+    const start = segmentSizes.slice(0, segIdx).reduce((a, b) => a + b, 0);
+    return [start, start + segmentSizes[segIdx]];
+  }
+
+  function reshuffle() {
+    const { tracks: chosen, segmentSizes: sizes } = pickForSegments(analyzed, segments, tolerance);
+    setPicked(chosen);
+    setSegmentSizes(sizes);
+  }
+
+  function replaceTrack(trackIdx: number) {
+    const segIdx = isMultiSegment ? getSegmentForIndex(trackIdx) : 0;
+    const seg = segments[segIdx];
+    const currentIds = new Set(picked.map((p) => p.track.id));
+    currentIds.delete(picked[trackIdx].track.id);
+    const available = analyzed.filter(
+      (a) =>
+        a.bpm !== null &&
+        Math.abs(a.bpm - seg.targetBpm) <= tolerance &&
+        !currentIds.has(a.track.id),
+    );
+    if (available.length === 0) return;
+    const replacement = available[Math.floor(Math.random() * available.length)];
+    const newPicked = [...picked];
+    newPicked[trackIdx] = replacement;
+    setPicked(newPicked);
+  }
+
+  function moveTrack(trackIdx: number, dir: "up" | "down") {
+    const targetIdx = dir === "up" ? trackIdx - 1 : trackIdx + 1;
+    if (isMultiSegment) {
+      const segIdx = getSegmentForIndex(trackIdx);
+      const [segStart, segEnd] = getSegmentBounds(segIdx);
+      if (targetIdx < segStart || targetIdx >= segEnd) return;
+    } else {
+      if (targetIdx < 0 || targetIdx >= picked.length) return;
+    }
+    const newPicked = [...picked];
+    [newPicked[trackIdx], newPicked[targetIdx]] = [newPicked[targetIdx], newPicked[trackIdx]];
+    setPicked(newPicked);
+  }
+
   const save = async () => {
     setPhase("saving");
     try {
-      const name = `${zone.label} run · ${zone.bpm} BPM`;
-      const desc = `${Math.round(totalMinutes(picked))} min @ ${zone.bpm}±${tolerance} BPM. Built with PaceBeat.`;
+      const name = isMultiSegment
+        ? `${segments.length}-Segment Run · ${Math.round(totalMinutes(picked))} min`
+        : `${segments[0].label} run · ${segments[0].targetBpm} BPM`;
+      const desc = isMultiSegment
+        ? `${segments.map((s) => `${s.label}: ${s.targetBpm}bpm`).join(" → ")}. Built with PaceBeat.`
+        : `${Math.round(totalMinutes(picked))} min @ ${segments[0].targetBpm}±${tolerance} BPM. Built with PaceBeat.`;
       const pl = await createPlaylist(name, desc);
       await addTracks(pl.id, picked.map((p) => p.track.uri));
       setPlaylistUrl(pl.external_urls.spotify);
@@ -669,15 +1301,40 @@ function GenerateStep({
   const noTempo = analyzed.length - matchedCount;
   const totalMin = totalMinutes(picked);
   const pct = progress.total ? (progress.done / progress.total) * 100 : 0;
+  const avgBpm = picked.length
+    ? Math.round(picked.reduce((s, p) => s + (p.bpm ?? 0), 0) / picked.length)
+    : 0;
+
+  // Grouped view for multi-segment: each entry has the segment, its time window, and track+startTime pairs
+  const segmentedView = useMemo(() => {
+    if (!isMultiSegment || segmentSizes.length === 0 || picked.length === 0) return null;
+    let trackIdx = 0;
+    let elapsedMs = 0;
+    return segments.map((seg, i) => {
+      const count = segmentSizes[i] ?? 0;
+      const segStartMs = elapsedMs;
+      const rows: { track: AnalyzedTrack; startMs: number; globalIdx: number }[] = [];
+      for (let j = 0; j < count && trackIdx < picked.length; j++, trackIdx++) {
+        rows.push({ track: picked[trackIdx], startMs: elapsedMs, globalIdx: trackIdx });
+        elapsedMs += picked[trackIdx].track.duration_ms;
+      }
+      return { seg, segStartMs, segEndMs: elapsedMs, rows };
+    });
+  }, [isMultiSegment, segmentSizes, segments, picked]);
+
+  const cardTitle = isMultiSegment
+    ? `${segments.length}-Segment Run`
+    : `${segments[0]?.label} · ${segments[0]?.targetBpm} BPM`;
+  const noMatchMsg = isMultiSegment
+    ? `No tracks matched within ±${tolerance} BPM for some segments. Try widening the tolerance.`
+    : `No tracks fell inside ±${tolerance} BPM of ${segments[0]?.targetBpm}. Try widening the tolerance or picking a different playlist.`;
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="font-display text-2xl">
-          {zone.label} · {zone.bpm} BPM
-        </CardTitle>
+        <CardTitle className="font-display text-2xl">{cardTitle}</CardTitle>
         <CardDescription>
-          Target {Math.round(targetMinutes)} min · from: {sourceLabel}
+          Target {Math.round(totalTargetMin)} min · from: {sourceLabel}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
@@ -699,19 +1356,100 @@ function GenerateStep({
             <div className="grid grid-cols-3 gap-3 text-center">
               <Stat label="Tracks" value={picked.length.toString()} />
               <Stat label="Length" value={`${Math.round(totalMin)}m`} />
-              <Stat label="Avg BPM" value={picked.length ? Math.round(picked.reduce((s, p) => s + (p.bpm ?? 0), 0) / picked.length).toString() : "—"} />
+              {isMultiSegment ? (
+                <Stat label="Segments" value={segments.length.toString()} />
+              ) : (
+                <Stat label="Avg BPM" value={avgBpm ? avgBpm.toString() : "—"} />
+              )}
             </div>
             {picked.length === 0 ? (
               <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm">
-                No tracks fell inside ±{tolerance} BPM of {zone.bpm}. Try widening the tolerance or picking a different playlist.
+                {noMatchMsg}
                 <p className="mt-2 text-xs text-muted-foreground">
                   Analyzed {analyzed.length} tracks · {matchedCount} had tempo data · {noTempo} skipped (no tempo found).
                 </p>
               </div>
+            ) : segmentedView ? (
+              // Multi-segment grouped view
+              <div className="max-h-[32rem] overflow-y-auto rounded-lg border border-border">
+                {segmentedView.map(({ seg, segStartMs, segEndMs, rows }, si) => (
+                  <div key={seg.id}>
+                    {/* Segment header */}
+                    <div className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-border bg-muted/80 px-3 py-2 backdrop-blur-sm">
+                      <div className="flex items-center gap-2">
+                        <span className="rounded bg-primary/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-widest text-primary">
+                          {si + 1}
+                        </span>
+                        <span className="text-sm font-semibold">{seg.label}</span>
+                        <span className="font-mono text-xs text-muted-foreground">{seg.targetBpm} BPM</span>
+                      </div>
+                      <span className="font-mono text-xs text-muted-foreground">
+                        {fmtTime(segStartMs)}–{fmtTime(segEndMs)}
+                      </span>
+                    </div>
+                    {/* Tracks in this segment */}
+                    {rows.length === 0 ? (
+                      <div className="px-3 py-2 text-xs text-muted-foreground italic">
+                        No matching tracks for this segment — try widening tolerance.
+                      </div>
+                    ) : (
+                      rows.map(({ track: p, startMs, globalIdx }, rowIdx) => (
+                        <div key={p.track.id} className="group flex items-center gap-3 border-b border-border/40 px-3 py-2 last:border-b-0">
+                          <span className="w-10 shrink-0 font-mono text-[11px] text-muted-foreground">{fmtTime(startMs)}</span>
+                          <img
+                            src={p.track.album.images?.[2]?.url ?? p.track.album.images?.[0]?.url ?? ""}
+                            alt=""
+                            className="h-9 w-9 shrink-0 rounded bg-muted object-cover"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-medium">{p.track.name}</div>
+                            <div className="truncate text-xs text-muted-foreground">
+                              {p.track.artists.map((a) => a.name).join(", ")}
+                            </div>
+                          </div>
+                          <span className="font-mono text-xs text-muted-foreground shrink-0">
+                            {fmtMs(p.track.duration_ms)}
+                          </span>
+                          <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="h-6 w-6"
+                              onClick={() => moveTrack(globalIdx, "up")}
+                              disabled={rowIdx === 0}
+                            >
+                              <ChevronUp className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="h-6 w-6"
+                              onClick={() => moveTrack(globalIdx, "down")}
+                              disabled={rowIdx === rows.length - 1}
+                            >
+                              <ChevronDown className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="h-6 w-6"
+                              onClick={() => replaceTrack(globalIdx)}
+                              title="Replace with a different track"
+                            >
+                              <RefreshCw className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                ))}
+              </div>
             ) : (
+              // Single-segment flat view
               <div className="space-y-1 max-h-96 overflow-y-auto rounded-lg border border-border">
                 {picked.map((p, i) => (
-                  <div key={p.track.id} className="flex items-center gap-3 border-b border-border/40 p-2 last:border-b-0">
+                  <div key={p.track.id} className="group flex items-center gap-3 border-b border-border/40 p-2 last:border-b-0">
                     <span className="w-6 text-right font-mono text-xs text-muted-foreground">{i + 1}</span>
                     <img
                       src={p.track.album.images?.[2]?.url ?? p.track.album.images?.[0]?.url ?? ""}
@@ -725,6 +1463,35 @@ function GenerateStep({
                       </div>
                     </div>
                     <div className="font-mono text-sm text-primary">{Math.round(p.bpm ?? 0)}</div>
+                    <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-6 w-6"
+                        onClick={() => moveTrack(i, "up")}
+                        disabled={i === 0}
+                      >
+                        <ChevronUp className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-6 w-6"
+                        onClick={() => moveTrack(i, "down")}
+                        disabled={i === picked.length - 1}
+                      >
+                        <ChevronDown className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-6 w-6"
+                        onClick={() => replaceTrack(i)}
+                        title="Replace with a different track"
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -732,8 +1499,11 @@ function GenerateStep({
             <p className="text-xs text-muted-foreground">
               Matched {picked.length} of {matchedCount} analyzable tracks. {noTempo > 0 && `${noTempo} skipped (no tempo data).`}
             </p>
-            <div className="flex justify-between">
+            <div className="flex items-center justify-between gap-3">
               <Button variant="ghost" onClick={onRestart}>Adjust pace</Button>
+              <Button variant="outline" onClick={reshuffle} disabled={analyzed.length === 0}>
+                <Shuffle className="h-4 w-4" /> Reshuffle
+              </Button>
               <Button variant="hero" size="lg" onClick={save} disabled={picked.length === 0}>
                 Save to Spotify <Music className="h-4 w-4" />
               </Button>

@@ -3,6 +3,7 @@
 import { analyze } from "web-audio-beat-detector";
 import type { SpotifyTrack } from "./spotify";
 import { resolveTrack } from "./deezer";
+import type { RunSegment } from "./pace";
 
 const cache = new Map<string, number>();
 
@@ -93,9 +94,15 @@ export function pickForRun(
   targetBpm: number,
   tolerance: number,
   targetMinutes: number,
+  exclude?: Set<string>,
 ): AnalyzedTrack[] {
   const matches = analyzed
-    .filter((a) => a.bpm !== null && Math.abs(a.bpm - targetBpm) <= tolerance)
+    .filter(
+      (a) =>
+        a.bpm !== null &&
+        Math.abs(a.bpm - targetBpm) <= tolerance &&
+        (!exclude || !exclude.has(a.track.id)),
+    )
     .sort((a, b) => Math.abs((a.bpm ?? 0) - targetBpm) - Math.abs((b.bpm ?? 0) - targetBpm));
 
   const targetMs = targetMinutes * 60_000;
@@ -113,4 +120,25 @@ export function pickForRun(
 
 export function totalMinutes(tracks: AnalyzedTrack[]): number {
   return tracks.reduce((s, a) => s + a.track.duration_ms, 0) / 60_000;
+}
+
+export function pickForSegments(
+  analyzed: AnalyzedTrack[],
+  segments: RunSegment[],
+  tolerance: number,
+): { tracks: AnalyzedTrack[]; segmentSizes: number[] } {
+  const usedIds = new Set<string>();
+  const tracks: AnalyzedTrack[] = [];
+  const segmentSizes: number[] = [];
+  for (const seg of segments) {
+    let picked = pickForRun(analyzed, seg.targetBpm, tolerance, seg.durationMin, usedIds);
+    if (picked.length === 0) {
+      // Fallback: allow repeats from earlier segments when pool is too small
+      picked = pickForRun(analyzed, seg.targetBpm, tolerance, seg.durationMin);
+    }
+    for (const t of picked) usedIds.add(t.track.id);
+    segmentSizes.push(picked.length);
+    tracks.push(...picked);
+  }
+  return { tracks, segmentSizes };
 }
