@@ -1249,16 +1249,23 @@ function GenerateStep({
   function replaceTrack(trackIdx: number) {
     const segIdx = isMultiSegment ? getSegmentForIndex(trackIdx) : 0;
     const seg = segments[segIdx];
+    // Exclude ALL currently picked tracks so we always get a genuinely different song
     const currentIds = new Set(picked.map((p) => p.track.id));
-    currentIds.delete(picked[trackIdx].track.id);
-    const available = analyzed.filter(
-      (a) =>
-        a.bpm !== null &&
-        Math.abs(a.bpm - seg.targetBpm) <= tolerance &&
-        !currentIds.has(a.track.id),
-    );
-    if (available.length === 0) return;
-    const replacement = available[Math.floor(Math.random() * available.length)];
+
+    const findCandidate = (tol: number) =>
+      analyzed.filter(
+        (a) =>
+          a.bpm !== null &&
+          Math.abs(a.bpm - seg.targetBpm) <= tol &&
+          !currentIds.has(a.track.id),
+      );
+
+    let pool = findCandidate(tolerance);
+    // If nothing in range, widen tolerance up to 2× before giving up
+    if (pool.length === 0) pool = findCandidate(tolerance * 2);
+    if (pool.length === 0) return;
+
+    const replacement = pool[Math.floor(Math.random() * pool.length)];
     const newPicked = [...picked];
     newPicked[trackIdx] = replacement;
     setPicked(newPicked);

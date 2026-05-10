@@ -96,6 +96,7 @@ export function pickForRun(
   targetMinutes: number,
   exclude?: Set<string>,
 ): AnalyzedTrack[] {
+  // Shuffle candidates before greedy fill so each call picks a different random subset
   const matches = analyzed
     .filter(
       (a) =>
@@ -103,19 +104,17 @@ export function pickForRun(
         Math.abs(a.bpm - targetBpm) <= tolerance &&
         (!exclude || !exclude.has(a.track.id)),
     )
-    .sort((a, b) => Math.abs((a.bpm ?? 0) - targetBpm) - Math.abs((b.bpm ?? 0) - targetBpm));
+    .sort(() => Math.random() - 0.5);
 
   const targetMs = targetMinutes * 60_000;
   const out: AnalyzedTrack[] = [];
   let total = 0;
-  // greedy fill, prefer closer-to-target first, then shuffle by bpm to vary
   for (const m of matches) {
     if (total >= targetMs) break;
     out.push(m);
     total += m.track.duration_ms;
   }
-  // gentle shuffle so it isn't strictly closest-first
-  return out.sort(() => Math.random() - 0.5);
+  return out;
 }
 
 export function totalMinutes(tracks: AnalyzedTrack[]): number {
