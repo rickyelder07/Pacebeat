@@ -32,9 +32,17 @@ import {
   isReadablePlaylist,
   getPlaylistTracks,
   getMyLikedTracks,
+  searchArtists,
+  searchTracksByArtist,
+  searchArtistAlbums,
+  getArtistTopTracks,
+  getArtistAlbums,
+  getAlbumTracks,
   createPlaylist,
   addTracks,
+  unfollowPlaylist,
   clearAuth,
+  type SpotifyArtist,
   type SpotifyPlaylist,
   type SpotifyTrack,
   type SpotifyUser,
@@ -88,7 +96,8 @@ type Step = "profile" | "pace" | "source" | "generate";
 
 export type Source =
   | { kind: "liked" }
-  | { kind: "playlist"; id: string; name: string };
+  | { kind: "playlist"; id: string; name: string }
+  | { kind: "artist"; id: string; name: string };
 
 function Build() {
   const authed = useRequireAuth();
@@ -256,6 +265,7 @@ function Build() {
                 segments={segments}
                 source={source}
                 tolerance={tolerance}
+                sex={profile.sex}
                 onRestart={() => setStep("pace")}
               />
             ) : (
@@ -380,6 +390,28 @@ function ProfileStep({
             min={77}
             max={440}
           />
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Label>Inseam (in)</Label>
+            <span className="text-xs text-muted-foreground">Optional · improves cadence accuracy</span>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="w-32">
+              <NumberField
+                label=""
+                value={Math.round(cmToIn(profile.inseamCm ?? profile.heightCm * 0.47))}
+                onChange={(v) => onChange({ ...profile, inseamCm: inToCm(v) })}
+                min={25}
+                max={40}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground leading-snug">
+              Your inseam from jeans or running pants. Longer legs = longer stride = fewer steps per minute.
+              Leave at the estimate if unsure.
+            </p>
+          </div>
         </div>
 
         <div className="space-y-2">
@@ -1060,6 +1092,10 @@ function SourceStep({
   const [playlists, setPlaylists] = useState<SpotifyPlaylist[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [sourceTab, setSourceTab] = useState<"library" | "artist">("library");
+  const [artistQuery, setArtistQuery] = useState("");
+  const [artistResults, setArtistResults] = useState<SpotifyArtist[]>([]);
+  const [artistSearching, setArtistSearching] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -1082,80 +1118,180 @@ function SourceStep({
     return () => { cancelled = true; };
   }, [currentUserId]);
 
+  useEffect(() => {
+    if (!artistQuery.trim()) {
+      setArtistResults([]);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setArtistSearching(true);
+      try {
+        const results = await searchArtists(artistQuery);
+        if (!cancelled) setArtistResults(results);
+      } catch {
+        if (!cancelled) setArtistResults([]);
+      } finally {
+        if (!cancelled) setArtistSearching(false);
+      }
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [artistQuery]);
+
   const isActive = (s: Source) =>
     source?.kind === s.kind && (s.kind === "liked" || (source.kind === "playlist" && source.id === s.id));
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="font-display text-2xl">Pick a playlist to draw from</CardTitle>
-        <CardDescription>We'll pull tracks from this source and match them to your target tempo.</CardDescription>
+        <CardTitle className="font-display text-2xl">Pick a music source</CardTitle>
+        <CardDescription>We'll pull tracks from here and match them to your target tempo.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {loading && (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin text-primary" /> Loading your playlists…
-          </div>
-        )}
-        {error && (
-          <div className="space-y-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive break-words font-mono">
-            <div>{error}</div>
-            {error.toLowerCase().includes("reconnect spotify") && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  clearAuth();
-                  window.location.href = "/";
-                }}
-              >
-                Reconnect Spotify
-              </Button>
+        <Tabs value={sourceTab} onValueChange={(v) => setSourceTab(v as "library" | "artist")}>
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="library">Your Library</TabsTrigger>
+            <TabsTrigger value="artist">By Artist</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="library" className="mt-3">
+            {loading && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin text-primary" /> Loading your playlists…
+              </div>
             )}
-          </div>
-        )}
-        {!loading && !error && (
-          <div className="max-h-[28rem] space-y-1 overflow-y-auto rounded-lg border border-border">
-            <button
-              onClick={() => onChange({ kind: "liked" })}
-              className={`flex w-full items-center gap-3 border-b border-border/40 p-3 text-left transition-colors ${
-                isActive({ kind: "liked" }) ? "bg-primary/10" : "hover:bg-surface/40"
-              }`}
-            >
-              <div className="flex h-12 w-12 items-center justify-center rounded bg-primary/20">
-                <Music className="h-5 w-5 text-primary" />
+            {error && (
+              <div className="space-y-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive break-words font-mono">
+                <div>{error}</div>
+                {error.toLowerCase().includes("reconnect spotify") && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      clearAuth();
+                      window.location.href = "/";
+                    }}
+                  >
+                    Reconnect Spotify
+                  </Button>
+                )}
               </div>
-              <div className="min-w-0 flex-1">
-                <div className="truncate font-medium">Liked Songs</div>
-                <div className="truncate text-xs text-muted-foreground">Your saved tracks</div>
-              </div>
-            </button>
-            {playlists.map((p) => {
-              const active = isActive({ kind: "playlist", id: p.id, name: p.name });
-              return (
+            )}
+            {!loading && !error && (
+              <div className="max-h-[28rem] space-y-1 overflow-y-auto rounded-lg border border-border">
                 <button
-                  key={p.id}
-                  onClick={() => onChange({ kind: "playlist", id: p.id, name: p.name })}
-                  className={`flex w-full items-center gap-3 border-b border-border/40 p-3 text-left transition-colors last:border-b-0 ${
-                    active ? "bg-primary/10" : "hover:bg-surface/40"
+                  onClick={() => onChange({ kind: "liked" })}
+                  className={`flex w-full items-center gap-3 border-b border-border/40 p-3 text-left transition-colors ${
+                    isActive({ kind: "liked" }) ? "bg-primary/10" : "hover:bg-surface/40"
                   }`}
                 >
-                  <img
-                    src={p.images?.[0]?.url ?? ""}
-                    alt=""
-                    className="h-12 w-12 rounded bg-muted object-cover"
-                  />
+                  <div className="flex h-12 w-12 items-center justify-center rounded bg-primary/20">
+                    <Music className="h-5 w-5 text-primary" />
+                  </div>
                   <div className="min-w-0 flex-1">
-                    <div className="truncate font-medium">{p.name ?? "Untitled playlist"}</div>
-                    <div className="truncate text-xs text-muted-foreground">
-                      {p.tracks?.total ?? 0} tracks{p.owner?.display_name ? ` · ${p.owner.display_name}` : ""}
-                    </div>
+                    <div className="truncate font-medium">Liked Songs</div>
+                    <div className="truncate text-xs text-muted-foreground">Your saved tracks</div>
                   </div>
                 </button>
-              );
-            })}
-          </div>
-        )}
+                {playlists.map((p) => {
+                  const active = isActive({ kind: "playlist", id: p.id, name: p.name });
+                  return (
+                    <button
+                      key={p.id}
+                      onClick={() => onChange({ kind: "playlist", id: p.id, name: p.name })}
+                      className={`flex w-full items-center gap-3 border-b border-border/40 p-3 text-left transition-colors last:border-b-0 ${
+                        active ? "bg-primary/10" : "hover:bg-surface/40"
+                      }`}
+                    >
+                      <img
+                        src={p.images?.[0]?.url ?? ""}
+                        alt=""
+                        className="h-12 w-12 rounded bg-muted object-cover"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate font-medium">{p.name ?? "Untitled playlist"}</div>
+                        <div className="truncate text-xs text-muted-foreground">
+                          {p.tracks?.total ?? 0} tracks{p.owner?.display_name ? ` · ${p.owner.display_name}` : ""}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </TabsContent>
+
+          <TabsContent value="artist" className="mt-3 space-y-3">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                className="pl-9"
+                placeholder="Search for an artist…"
+                value={artistQuery}
+                onChange={(e) => setArtistQuery(e.target.value)}
+              />
+            </div>
+            {artistSearching && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin text-primary" /> Searching…
+              </div>
+            )}
+            {artistResults.length > 0 && (
+              <div className="max-h-[28rem] space-y-1 overflow-y-auto rounded-lg border border-border">
+                {artistResults.map((a) => {
+                  const active = source?.kind === "artist" && source.id === a.id;
+                  return (
+                    <button
+                      key={a.id}
+                      onClick={() => onChange({ kind: "artist", id: a.id, name: a.name })}
+                      className={`flex w-full items-center gap-3 border-b border-border/40 p-3 text-left transition-colors last:border-b-0 ${
+                        active ? "bg-primary/10" : "hover:bg-surface/40"
+                      }`}
+                    >
+                      {a.images?.[0]?.url ? (
+                        <img
+                          src={a.images[0].url}
+                          alt=""
+                          className="h-12 w-12 rounded-full bg-muted object-cover"
+                        />
+                      ) : (
+                        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-primary/20">
+                          <Music className="h-5 w-5 text-primary" />
+                        </div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate font-medium">{a.name}</div>
+                        {a.genres?.length > 0 && (
+                          <div className="truncate text-xs text-muted-foreground">
+                            {a.genres.slice(0, 3).join(", ")}
+                          </div>
+                        )}
+                      </div>
+                      {active && (
+                        <span className="shrink-0 rounded-full bg-primary/15 px-2 py-0.5 font-mono text-[10px] text-primary">
+                          Selected
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {!artistSearching && artistQuery.trim() && artistResults.length === 0 && (
+              <p className="text-sm text-muted-foreground">No artists found for "{artistQuery}".</p>
+            )}
+            {source?.kind === "artist" && (
+              <div className="rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
+                <span className="text-muted-foreground">Selected: </span>
+                <span className="font-medium">{source.name}</span>
+                <span className="ml-2 text-xs text-muted-foreground">— top tracks + albums (up to 150 songs)</span>
+              </div>
+            )}
+          </TabsContent>
+        </Tabs>
 
         <div className="flex justify-between">
           <Button variant="ghost" onClick={onBack}>Back</Button>
@@ -1173,14 +1309,19 @@ function GenerateStep({
   segments,
   source,
   tolerance,
+  sex,
   onRestart,
 }: {
   me: SpotifyUser;
   segments: RunSegment[];
   source: Source;
   tolerance: number;
+  sex: import("@/lib/pace").Sex;
   onRestart: () => void;
 }) {
+  const runnerEmoji = sex === "female" ? "🏃‍♀️" : "🏃‍♂️";
+  const fixedPlaylistName = `Playlist by PaceBeat ${runnerEmoji}`;
+
   const [phase, setPhase] = useState<"loading" | "analyzing" | "ready" | "saving" | "saved" | "error">("loading");
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [analyzed, setAnalyzed] = useState<AnalyzedTrack[]>([]);
@@ -1188,6 +1329,9 @@ function GenerateStep({
   const [segmentSizes, setSegmentSizes] = useState<number[]>([]);
   const [playlistUrl, setPlaylistUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
+  const [saveMode, setSaveMode] = useState<"default" | "new">("default");
+  const [newPlaylistName, setNewPlaylistName] = useState("");
+  const [defaultPlaylistId, setDefaultPlaylistId] = useState<string | null>(null);
 
   const sourceLabel = source.kind === "liked" ? "Liked Songs" : source.name;
   const isMultiSegment = segments.length > 1;
@@ -1198,9 +1342,89 @@ function GenerateStep({
     (async () => {
       try {
         setPhase("loading");
-        const pool: SpotifyTrack[] = source.kind === "liked"
-          ? await getMyLikedTracks(1000)
-          : await getPlaylistTracks(source.id, 1000);
+        let pool: SpotifyTrack[];
+        if (source.kind === "liked") {
+          pool = await getMyLikedTracks(1000);
+        } else if (source.kind === "playlist") {
+          pool = await getPlaylistTracks(source.id, 1000);
+        } else {
+          // Artist: top tracks + albums, capped at 150.
+          // Both endpoints may be restricted for apps in Spotify development mode,
+          // so we fall back to a search query if the pool ends up empty.
+          const [topTracksResult, albumsResult] = await Promise.allSettled([
+            getArtistTopTracks(source.id),
+            getArtistAlbums(source.id),
+          ]);
+          const topTracks_ = topTracksResult.status === "fulfilled" ? (topTracksResult.value ?? []) : [];
+          const albums = albumsResult.status === "fulfilled" ? (albumsResult.value ?? []) : [];
+          if (topTracksResult.status === "rejected") {
+            console.warn("[artist] getArtistTopTracks failed:", topTracksResult.reason);
+          }
+          if (albumsResult.status === "rejected") {
+            console.warn("[artist] getArtistAlbums failed:", albumsResult.reason);
+          }
+          const seen = new Set<string>(topTracks_.map((t) => t.id));
+          const artistPool: SpotifyTrack[] = [...topTracks_];
+          for (let i = 0; i < albums.length && artistPool.length < 150; i += 5) {
+            if (cancelled) return;
+            const batch = albums.slice(i, i + 5);
+            const results = await Promise.allSettled(batch.map((a) => getAlbumTracks(a.id)));
+            for (const res of results) {
+              if (res.status !== "fulfilled") continue;
+              for (const t of res.value) {
+                if (!seen.has(t.id) && artistPool.length < 150) {
+                  seen.add(t.id);
+                  artistPool.push(t);
+                }
+              }
+            }
+          }
+          if (artistPool.length > 0) {
+            pool = artistPool;
+          } else {
+            // Artist-specific endpoints are blocked in Spotify dev mode.
+            // Run album search + two track-search queries in parallel so each
+            // query surfaces a different slice of the artist's catalog.
+            console.log("[artist] falling back to search-based pool for:", source.name);
+            const [albumTracksResult, searchResult1, searchResult2] = await Promise.allSettled([
+              searchArtistAlbums(source.name, source.id, 20).then(async (foundAlbums) => {
+                const tracks: SpotifyTrack[] = [];
+                const seenTrack = new Set<string>();
+                for (let i = 0; i < foundAlbums.length && tracks.length < 150; i += 5) {
+                  if (cancelled) return tracks;
+                  const batch = foundAlbums.slice(i, i + 5);
+                  const results = await Promise.allSettled(batch.map((a) => getAlbumTracks(a.id)));
+                  for (const res of results) {
+                    if (res.status !== "fulfilled") continue;
+                    for (const t of res.value) {
+                      // Verify this track is actually by the target artist
+                      if (!seenTrack.has(t.id) && tracks.length < 150 && t.artists?.some((a) => a.id === source.id)) {
+                        seenTrack.add(t.id);
+                        tracks.push(t);
+                      }
+                    }
+                  }
+                }
+                return tracks;
+              }),
+              // Primary name search — broad coverage
+              searchTracksByArtist(source.name, source.id, 150),
+              // Secondary query with "songs" appended — hits different Spotify index results
+              searchTracksByArtist(source.name + " songs", source.id, 100),
+            ]);
+            const combined = new Map<string, SpotifyTrack>();
+            if (albumTracksResult.status === "fulfilled") {
+              for (const t of albumTracksResult.value) combined.set(t.id, t);
+            }
+            if (searchResult1.status === "fulfilled") {
+              for (const t of searchResult1.value) combined.set(t.id, t);
+            }
+            if (searchResult2.status === "fulfilled") {
+              for (const t of searchResult2.value) combined.set(t.id, t);
+            }
+            pool = Array.from(combined.values()).slice(0, 300);
+          }
+        }
         if (cancelled) return;
         const map = new Map<string, SpotifyTrack>();
         pool.forEach((t) => t && map.set(t.id, t));
@@ -1224,6 +1448,11 @@ function GenerateStep({
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const storedId = localStorage.getItem("pacebeat_default_playlist_id");
+    if (storedId) setDefaultPlaylistId(storedId);
   }, []);
 
   function getSegmentForIndex(trackIdx: number): number {
@@ -1288,15 +1517,52 @@ function GenerateStep({
   const save = async () => {
     setPhase("saving");
     try {
-      const name = isMultiSegment
-        ? `${segments.length}-Segment Run · ${Math.round(totalMinutes(picked))} min`
-        : `${segments[0].label} run · ${segments[0].targetBpm} BPM`;
+      // Derive pace and distance from BPM targets (inverse of paceToBpm: paceMinPerKm = (200 - bpm) / 6)
+      const segmentDesc = (s: RunSegment) => {
+        const paceMinPerKm = (200 - s.targetBpm) / 6;
+        return `${s.label}: ${s.targetBpm} BPM · ${formatPace(paceMinPerKm)}`;
+      };
+      const totalDistanceMi = segments.reduce((sum, s) => {
+        const paceMinPerMi = (200 - s.targetBpm) / 6 * 1.609344;
+        return sum + s.durationMin / paceMinPerMi;
+      }, 0);
+      const distStr = `${totalDistanceMi.toFixed(1)} mi`;
       const desc = isMultiSegment
-        ? `${segments.map((s) => `${s.label}: ${s.targetBpm}bpm`).join(" → ")}. Built with PaceBeat.`
-        : `${Math.round(totalMinutes(picked))} min @ ${segments[0].targetBpm}±${tolerance} BPM. Built with PaceBeat.`;
-      const pl = await createPlaylist(name, desc);
-      await addTracks(pl.id, picked.map((p) => p.track.uri));
-      setPlaylistUrl(pl.external_urls.spotify);
+        ? `${segments.map(segmentDesc).join(" → ")} · ${distStr}. Built with PaceBeat.`
+        : `${distStr} @ ${segments[0].targetBpm}±${tolerance} BPM · ${formatPace((200 - segments[0].targetBpm) / 6)}. Built with PaceBeat.`;
+      const uris = picked.map((p) => p.track.uri);
+
+      if (saveMode === "default") {
+        const name = fixedPlaylistName;
+
+        // Best-effort cleanup: unfollow stored playlist by ID
+        if (defaultPlaylistId) {
+          try { await unfollowPlaylist(defaultPlaylistId); } catch { /* ignore */ }
+        }
+        // Best-effort cleanup: unfollow any other playlists with the same name owned by this user
+        try {
+          const existing = await getMyPlaylists(50);
+          for (const pl of existing) {
+            if (pl.owner?.id === me.id && pl.name === name) {
+              try { await unfollowPlaylist(pl.id); } catch { /* ignore */ }
+            }
+          }
+        } catch { /* ignore */ }
+
+        // Always create fresh — avoids all track-modification endpoint restrictions
+        const pl = await createPlaylist(name, desc);
+        await addTracks(pl.id, uris);
+        localStorage.setItem("pacebeat_default_playlist_id", pl.id);
+        setDefaultPlaylistId(pl.id);
+        setPlaylistUrl(pl.external_urls.spotify);
+      } else {
+        const name = newPlaylistName.trim() || (isMultiSegment
+          ? `${segments.length}-Segment Run · ${Math.round(totalMinutes(picked))} min`
+          : `${segments[0].label} run · ${segments[0].targetBpm} BPM`);
+        const pl = await createPlaylist(name, desc);
+        await addTracks(pl.id, uris);
+        setPlaylistUrl(pl.external_urls.spotify);
+      }
       setPhase("saved");
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : "Save failed");
@@ -1506,6 +1772,50 @@ function GenerateStep({
             <p className="text-xs text-muted-foreground">
               Matched {picked.length} of {matchedCount} analyzable tracks. {noTempo > 0 && `${noTempo} skipped (no tempo data).`}
             </p>
+            <div className="rounded-lg border border-border bg-surface/20 p-3 space-y-3">
+              <div className="flex gap-2">
+                <Button
+                  variant={saveMode === "default" ? "default" : "outline"}
+                  size="sm"
+                  className="flex-1"
+                  onClick={() => setSaveMode("default")}
+                >
+                  Update PaceBeat playlist {runnerEmoji}
+                </Button>
+                <Button
+                  variant={saveMode === "new" ? "default" : "outline"}
+                  size="sm"
+                  className="flex-1"
+                  onClick={() => setSaveMode("new")}
+                >
+                  New playlist
+                </Button>
+              </div>
+              {saveMode === "default" && (
+                <p className="text-xs text-muted-foreground">
+                  {defaultPlaylistId
+                    ? `"${fixedPlaylistName}" will be replaced with your new playlist.`
+                    : `A playlist named "${fixedPlaylistName}" will be created and reused on future saves.`}
+                </p>
+              )}
+              {saveMode === "new" && (
+                <div className="space-y-1.5">
+                  <Label htmlFor="new-playlist-name" className="text-xs text-muted-foreground">Playlist name</Label>
+                  <Input
+                    id="new-playlist-name"
+                    value={newPlaylistName}
+                    onChange={(e) => setNewPlaylistName(e.target.value)}
+                    placeholder={isMultiSegment
+                      ? `${segments.length}-Segment Run · ${Math.round(totalMin)} min`
+                      : `${segments[0].label} run · ${segments[0].targetBpm} BPM`}
+                    className="h-8 text-sm"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    A new playlist will be added to your Spotify account.
+                  </p>
+                </div>
+              )}
+            </div>
             <div className="flex items-center justify-between gap-3">
               <Button variant="ghost" onClick={onRestart}>Adjust pace</Button>
               <Button variant="outline" onClick={reshuffle} disabled={analyzed.length === 0}>

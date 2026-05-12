@@ -294,7 +294,9 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 
     if (res.ok) {
       if (res.status === 204) return undefined as T;
-      return res.json();
+      const text = await res.text();
+      if (!text.trim()) return undefined as T;
+      return JSON.parse(text) as T;
     }
 
     if (res.status === 401) {
@@ -314,6 +316,14 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     }
 
     const body = await res.text();
+    if (res.status === 429) {
+      const retryAfter = res.headers.get("Retry-After");
+      throw new Error(
+        retryAfter
+          ? `Spotify is rate-limiting requests right now. Please wait ${retryAfter} seconds and try again.`
+          : "Spotify is rate-limiting requests right now. Please wait a moment and try again."
+      );
+    }
     if (res.status === 403) {
       const lowerBody = body.toLowerCase();
       if (lowerBody.includes("insufficient client scope") || lowerBody.includes("insufficient scope")) {
@@ -631,16 +641,122 @@ export async function searchTracksByGenre(genre: string, limit = 50): Promise<Sp
   return items;
 }
 
+// Plain-name track search filtered client-side by artist ID.
+// Any `artist:` field filter (quoted or unquoted) is restricted in Spotify
+// dev mode and returns very few results; a plain name query returns more.
+export async function searchTracksByArtist(
+  artistName: string,
+  artistId: string,
+  limit = 150,
+): Promise<SpotifyTrack[]> {
+  const items: SpotifyTrack[] = [];
+  const seen = new Set<string>();
+  const perPage = 10; // Spotify dev mode caps search at 10 results per page
+  let offset = 0;
+  const maxPages = 40; // scan up to 400 results to find enough matches
+  let pages = 0;
+
+  while (items.length < limit && pages < maxPages) {
+    const r = await api<{ tracks: { items: SpotifyTrack[]; next: string | null } }>(
+      `/search?type=track&limit=${perPage}&offset=${offset}&q=${encodeURIComponent(artistName)}`
+    );
+    for (const track of r.tracks.items) {
+      if (seen.has(track.id)) continue;
+      if (track.artists?.some((a) => a.id === artistId)) {
+        seen.add(track.id);
+        items.push(track);
+      }
+    }
+    if (!r.tracks.next || r.tracks.items.length === 0) break;
+    offset += r.tracks.items.length;
+    pages++;
+  }
+  return items.slice(0, limit);
+}
+
+// Load artist tracks by searching for playlists named after the artist, then
+// filtering their tracks by artist ID. Public playlists are accessible in
+// Spotify dev mode even when artist-specific endpoints are blocked. Each
+// playlist can contain dozens of the artist's tracks, giving much better
+// coverage than the direct track search alone.
+export async function searchArtistViaPlaylists(
+  artistName: string,
+  artistId: string,
+  maxPlaylists = 5,
+  maxTracksPerPlaylist = 100,
+): Promise<SpotifyTrack[]> {
+  const r = await api<{
+    playlists: { items: Array<{ id: string; owner?: { id?: string } } | null> };
+  }>(`/search?type=playlist&limit=${maxPlaylists}&q=${encodeURIComponent(artistName)}`);
+
+  const playlists = (r.playlists?.items ?? []).filter(
+    (p): p is { id: string; owner?: { id?: string } } =>
+      !!p?.id && p.owner?.id !== "spotify",
+  );
+
+  const seen = new Set<string>();
+  const out: SpotifyTrack[] = [];
+
+  for (const playlist of playlists) {
+    try {
+      const tracks = await getPlaylistTracks(playlist.id, maxTracksPerPlaylist);
+      for (const track of tracks) {
+        if (seen.has(track.id)) continue;
+        if (track.artists?.some((a) => a.id === artistId)) {
+          seen.add(track.id);
+          out.push(track);
+        }
+      }
+    } catch {
+      // playlist inaccessible (e.g. blocked editorial playlist) — skip it
+    }
+  }
+
+  return out;
+}
+
 export async function getArtistTopTracks(artistId: string, market = "US"): Promise<SpotifyTrack[]> {
   const r = await api<{ tracks: SpotifyTrack[] }>(`/artists/${artistId}/top-tracks?market=${market}`);
   return r.tracks;
 }
 
-export async function getArtistAlbums(artistId: string): Promise<{ id: string }[]> {
-  const r = await api<{ items: { id: string }[] }>(
-    `/artists/${artistId}/albums?include_groups=album,single&limit=20`
-  );
-  return r.items;
+export async function getArtistAlbums(artistId: string, max = 50): Promise<{ id: string }[]> {
+  const out: { id: string }[] = [];
+  // URL-encode the comma so Spotify's parser treats it as one parameter value.
+  // Also use limit=10 since dev-mode apps hit "Invalid limit" at higher values.
+  let url: string | null = `/artists/${artistId}/albums?include_groups=album%2Csingle&limit=10`;
+  while (url && out.length < max) {
+    const r = await api<{ items: { id: string }[]; next: string | null }>(url);
+    out.push(...(r.items ?? []));
+    url = r.next ? r.next.replace("https://api.spotify.com/v1", "") : null;
+  }
+  return out.slice(0, max);
+}
+
+// Search for an artist's albums via the /search endpoint, which works in
+// Spotify development mode even when /artists/{id}/albums is restricted.
+// Returns [] instead of throwing so callers can always use Promise.allSettled.
+export async function searchArtistAlbums(
+  artistName: string,
+  artistId: string,
+  maxAlbums = 20,
+): Promise<{ id: string }[]> {
+  try {
+    const r = await api<{
+      albums: { items: Array<{ id: string; artists: { id: string }[] } | null> };
+    }>(`/search?type=album&limit=${Math.min(maxAlbums, 50)}&q=${encodeURIComponent(artistName)}`);
+    const items = r.albums?.items ?? [];
+    // Prefer albums where the artist ID matches; fall back to all results so
+    // we can filter at the track level if the album-level artists list is sparse.
+    const strict = items.filter(
+      (a): a is { id: string; artists: { id: string }[] } =>
+        !!a?.id && !!a.artists?.some((ar) => ar.id === artistId),
+    );
+    const pool = strict.length > 0 ? strict : items.filter((a): a is { id: string; artists: { id: string }[] } => !!a?.id);
+    return pool.map((a) => ({ id: a.id }));
+  } catch {
+    return [];
+  }
 }
 
 export async function getAlbumTracks(albumId: string): Promise<SpotifyTrack[]> {
@@ -676,6 +792,17 @@ export async function addTracks(playlistId: string, uris: string[]) {
       body: JSON.stringify({ uris: uris.slice(i, i + 100) }),
     });
   }
+}
+
+export async function updatePlaylistDetails(playlistId: string, name: string, description: string) {
+  await api(`/playlists/${playlistId}`, {
+    method: "PUT",
+    body: JSON.stringify({ name, description }),
+  });
+}
+
+export async function unfollowPlaylist(playlistId: string) {
+  await api(`/playlists/${playlistId}/followers`, { method: "DELETE" });
 }
 
 export const SPOTIFY_GENRES = [
