@@ -8,6 +8,24 @@ export interface DeezerResolved {
   bpm: number | null;
 }
 
+export interface DeezerArtistResult {
+  id: number;
+  name: string;
+  picture_medium: string;
+  nb_album: number;
+}
+
+export interface DeezerFullTrack {
+  id: number;
+  title: string;
+  duration: number;
+  bpm: number;
+  isrc: string;
+  preview: string;
+  artist: { id: number; name: string };
+  album?: { id: number; title: string; cover_medium: string };
+}
+
 interface DeezerTrack {
   id: number;
   title: string;
@@ -94,6 +112,84 @@ async function mapWithConcurrency<T, R>(
   await Promise.all(workers);
   return out;
 }
+
+export const searchDeezerArtists = createServerFn({ method: "POST" })
+  .inputValidator((data: unknown) => {
+    const q = (data as { q?: string })?.q ?? "";
+    return { q: String(q).slice(0, 200) };
+  })
+  .handler(async ({ data }) => {
+    const r = await fetchJson<{ data: DeezerArtistResult[] }>(
+      `https://api.deezer.com/search/artist?limit=10&q=${encodeURIComponent(data.q)}`,
+    );
+    return { artists: r?.data ?? [] };
+  });
+
+interface DeezerAlbum {
+  id: number;
+  title: string;
+  cover_medium: string;
+  record_type?: string;
+}
+
+interface DeezerAlbumResponse {
+  id: number;
+  title: string;
+  cover_medium: string;
+  tracks: { data: DeezerFullTrack[] };
+}
+
+// Compound server function: fetches albums then full track data (with BPM + ISRC) in one server round-trip.
+export const getDeezerArtistTrackPool = createServerFn({ method: "POST" })
+  .inputValidator((data: unknown) => {
+    const d = data as { artistId?: number | string; limit?: number };
+    return { artistId: Number(d.artistId), limit: Math.min(Number(d.limit ?? 150), 200) };
+  })
+  .handler(async ({ data }) => {
+    const albumsRes = await fetchJson<{ data: DeezerAlbum[] }>(
+      `https://api.deezer.com/artist/${data.artistId}/albums?limit=25&index=0`,
+    );
+    const albums = albumsRes?.data ?? [];
+
+    const seen = new Set<number>();
+    const tracks: DeezerFullTrack[] = [];
+
+    for (const album of albums) {
+      if (tracks.length >= data.limit) break;
+      const albumFull = await fetchJson<DeezerAlbumResponse>(
+        `https://api.deezer.com/album/${album.id}`,
+      );
+      if (!albumFull) continue;
+      for (const t of albumFull.tracks?.data ?? []) {
+        if (!seen.has(t.id) && tracks.length < data.limit) {
+          seen.add(t.id);
+          tracks.push({
+            ...t,
+            album: { id: albumFull.id, title: albumFull.title, cover_medium: albumFull.cover_medium },
+          });
+        }
+      }
+    }
+
+    return { tracks };
+  });
+
+export const searchDeezerTracksByBpm = createServerFn({ method: "POST" })
+  .inputValidator((data: unknown) => {
+    const d = data as { genre?: string; bpmMin?: number; bpmMax?: number; limit?: number };
+    return {
+      genre: String(d.genre ?? "").slice(0, 100),
+      bpmMin: Number(d.bpmMin ?? 120),
+      bpmMax: Number(d.bpmMax ?? 200),
+      limit: Math.min(Number(d.limit ?? 75), 100),
+    };
+  })
+  .handler(async ({ data }) => {
+    const q = data.genre;
+    const url = `https://api.deezer.com/search/track?limit=${data.limit}&q=${encodeURIComponent(q)}&bpm_min=${data.bpmMin}&bpm_max=${data.bpmMax}`;
+    const r = await fetchJson<{ data: DeezerFullTrack[] }>(url);
+    return { tracks: r?.data ?? [] };
+  });
 
 export const resolveDeezerBatch = createServerFn({ method: "POST" })
   .inputValidator((data: unknown) => {

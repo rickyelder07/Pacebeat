@@ -805,6 +805,46 @@ export async function unfollowPlaylist(playlistId: string) {
   await api(`/playlists/${playlistId}/followers`, { method: "DELETE" });
 }
 
+export async function resolveSpotifyUrisFromIsrcs(isrcs: string[]): Promise<string[]> {
+  if (isrcs.length === 0) return [];
+  const uris: (string | null)[] = new Array(isrcs.length).fill(null);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(4, isrcs.length) }, async () => {
+    while (i < isrcs.length) {
+      const idx = i++;
+      try {
+        const r = await api<{ tracks: { items: SpotifyTrack[] } }>(
+          `/search?type=track&q=${encodeURIComponent(`isrc:${isrcs[idx]}`)}&limit=1`,
+        );
+        uris[idx] = r?.tracks?.items?.[0]?.uri ?? null;
+      } catch {
+        uris[idx] = null;
+      }
+    }
+  });
+  await Promise.all(workers);
+  return uris.filter((u): u is string => u !== null);
+}
+
+import type { Track } from "./types";
+
+export function spotifyTrackToTrack(t: SpotifyTrack): Track {
+  return {
+    id: t.id,
+    name: t.name,
+    durationMs: t.duration_ms,
+    bpm: null,
+    isrc: t.external_ids?.isrc ?? null,
+    previewUrl: t.preview_url,
+    artists: t.artists.map((a) => ({ name: a.name })),
+    album: {
+      name: t.album.name,
+      imageUrl: t.album.images?.[0]?.url ?? null,
+    },
+    spotifyUri: t.uri,
+  };
+}
+
 export const SPOTIFY_GENRES = [
   "pop", "rock", "hip-hop", "electronic", "dance", "house", "techno",
   "indie", "alternative", "metal", "punk", "r-n-b", "soul", "funk",

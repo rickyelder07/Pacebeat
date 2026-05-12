@@ -32,7 +32,6 @@ import {
   isReadablePlaylist,
   getPlaylistTracks,
   getMyLikedTracks,
-  searchArtists,
   searchTracksByArtist,
   searchArtistAlbums,
   getArtistTopTracks,
@@ -42,12 +41,21 @@ import {
   addTracks,
   unfollowPlaylist,
   clearAuth,
-  type SpotifyArtist,
+  resolveSpotifyUrisFromIsrcs,
+  spotifyTrackToTrack,
   type SpotifyPlaylist,
   type SpotifyTrack,
   type SpotifyUser,
 } from "@/lib/spotify";
 import { analyzeTracks, pickForSegments, totalMinutes, type AnalyzedTrack } from "@/lib/bpm";
+import {
+  searchArtists as searchDeezerArtists,
+  getArtistTrackPool,
+  fetchTracksByBpm,
+  type DeezerArtist,
+} from "@/lib/deezer-catalog";
+import { RUNNING_GENRES } from "@/lib/deezer-genres";
+import type { Track } from "@/lib/types";
 import { useRequireAuth } from "@/hooks/use-auth";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
@@ -97,7 +105,9 @@ type Step = "profile" | "pace" | "source" | "generate";
 export type Source =
   | { kind: "liked" }
   | { kind: "playlist"; id: string; name: string }
-  | { kind: "artist"; id: string; name: string };
+  | { kind: "artist"; id: string; name: string }
+  | { kind: "deezer-artist"; id: string; name: string }
+  | { kind: "genre"; genreId: number; genreName: string };
 
 function Build() {
   const authed = useRequireAuth();
@@ -1089,34 +1099,21 @@ function SourceStep({
   onBack: () => void;
   onNext: () => void;
 }) {
-  const [playlists, setPlaylists] = useState<SpotifyPlaylist[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [sourceTab, setSourceTab] = useState<"library" | "artist">("library");
+  const devMode = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("dev") === "true";
+
+  // Deezer artist search state
   const [artistQuery, setArtistQuery] = useState("");
-  const [artistResults, setArtistResults] = useState<SpotifyArtist[]>([]);
+  const [artistResults, setArtistResults] = useState<DeezerArtist[]>([]);
   const [artistSearching, setArtistSearching] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    getMyPlaylists(50)
-      .then((p) => {
-        if (cancelled) return;
-        const safe = (p ?? [])
-          .filter((x): x is SpotifyPlaylist => !!x && !!x.id)
-          .filter((x) => isReadablePlaylist(x, currentUserId));
-        setPlaylists(safe);
-        setLoading(false);
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        console.error("getMyPlaylists failed:", e);
-        setError(e instanceof Error ? e.message : String(e));
-        setLoading(false);
-      });
-    return () => { cancelled = true; };
-  }, [currentUserId]);
+  // Dev-mode Spotify library state
+  const [playlists, setPlaylists] = useState<SpotifyPlaylist[]>([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [libraryLoaded, setLibraryLoaded] = useState(false);
+
+  type SourceTab = "artist" | "genre" | "library";
+  const [sourceTab, setSourceTab] = useState<SourceTab>("artist");
 
   useEffect(() => {
     if (!artistQuery.trim()) {
@@ -1127,7 +1124,7 @@ function SourceStep({
     const timer = setTimeout(async () => {
       setArtistSearching(true);
       try {
-        const results = await searchArtists(artistQuery);
+        const results = await searchDeezerArtists(artistQuery);
         if (!cancelled) setArtistResults(results);
       } catch {
         if (!cancelled) setArtistResults([]);
@@ -1141,8 +1138,32 @@ function SourceStep({
     };
   }, [artistQuery]);
 
-  const isActive = (s: Source) =>
-    source?.kind === s.kind && (s.kind === "liked" || (source.kind === "playlist" && source.id === s.id));
+  useEffect(() => {
+    if (sourceTab !== "library" || libraryLoaded || !devMode) return;
+    let cancelled = false;
+    setLibraryLoading(true);
+    getMyPlaylists(50)
+      .then((p) => {
+        if (cancelled) return;
+        const safe = (p ?? [])
+          .filter((x): x is SpotifyPlaylist => !!x && !!x.id)
+          .filter((x) => isReadablePlaylist(x, currentUserId));
+        setPlaylists(safe);
+        setLibraryLoaded(true);
+        setLibraryLoading(false);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setLibraryError(e instanceof Error ? e.message : String(e));
+        setLibraryLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [sourceTab, libraryLoaded, devMode, currentUserId]);
+
+  const isLibraryActive = (s: Source) =>
+    source?.kind === s.kind && (s.kind === "liked" || (source.kind === "playlist" && source.id === (s as { id: string }).id));
+
+  const colCount = devMode ? 3 : 2;
 
   return (
     <Card>
@@ -1151,79 +1172,14 @@ function SourceStep({
         <CardDescription>We'll pull tracks from here and match them to your target tempo.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <Tabs value={sourceTab} onValueChange={(v) => setSourceTab(v as "library" | "artist")}>
-          <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="library">Your Library</TabsTrigger>
+        <Tabs value={sourceTab} onValueChange={(v) => setSourceTab(v as SourceTab)}>
+          <TabsList className={`grid w-full grid-cols-${colCount}`}>
             <TabsTrigger value="artist">By Artist</TabsTrigger>
+            <TabsTrigger value="genre">By Genre</TabsTrigger>
+            {devMode && <TabsTrigger value="library">Library (dev)</TabsTrigger>}
           </TabsList>
 
-          <TabsContent value="library" className="mt-3">
-            {loading && (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin text-primary" /> Loading your playlists…
-              </div>
-            )}
-            {error && (
-              <div className="space-y-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive break-words font-mono">
-                <div>{error}</div>
-                {error.toLowerCase().includes("reconnect spotify") && (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => {
-                      clearAuth();
-                      window.location.href = "/";
-                    }}
-                  >
-                    Reconnect Spotify
-                  </Button>
-                )}
-              </div>
-            )}
-            {!loading && !error && (
-              <div className="max-h-[28rem] space-y-1 overflow-y-auto rounded-lg border border-border">
-                <button
-                  onClick={() => onChange({ kind: "liked" })}
-                  className={`flex w-full items-center gap-3 border-b border-border/40 p-3 text-left transition-colors ${
-                    isActive({ kind: "liked" }) ? "bg-primary/10" : "hover:bg-surface/40"
-                  }`}
-                >
-                  <div className="flex h-12 w-12 items-center justify-center rounded bg-primary/20">
-                    <Music className="h-5 w-5 text-primary" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate font-medium">Liked Songs</div>
-                    <div className="truncate text-xs text-muted-foreground">Your saved tracks</div>
-                  </div>
-                </button>
-                {playlists.map((p) => {
-                  const active = isActive({ kind: "playlist", id: p.id, name: p.name });
-                  return (
-                    <button
-                      key={p.id}
-                      onClick={() => onChange({ kind: "playlist", id: p.id, name: p.name })}
-                      className={`flex w-full items-center gap-3 border-b border-border/40 p-3 text-left transition-colors last:border-b-0 ${
-                        active ? "bg-primary/10" : "hover:bg-surface/40"
-                      }`}
-                    >
-                      <img
-                        src={p.images?.[0]?.url ?? ""}
-                        alt=""
-                        className="h-12 w-12 rounded bg-muted object-cover"
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate font-medium">{p.name ?? "Untitled playlist"}</div>
-                        <div className="truncate text-xs text-muted-foreground">
-                          {p.tracks?.total ?? 0} tracks{p.owner?.display_name ? ` · ${p.owner.display_name}` : ""}
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </TabsContent>
-
+          {/* ── Deezer Artist Tab ── */}
           <TabsContent value="artist" className="mt-3 space-y-3">
             <div className="relative">
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
@@ -1242,18 +1198,18 @@ function SourceStep({
             {artistResults.length > 0 && (
               <div className="max-h-[28rem] space-y-1 overflow-y-auto rounded-lg border border-border">
                 {artistResults.map((a) => {
-                  const active = source?.kind === "artist" && source.id === a.id;
+                  const active = source?.kind === "deezer-artist" && source.id === String(a.id);
                   return (
                     <button
                       key={a.id}
-                      onClick={() => onChange({ kind: "artist", id: a.id, name: a.name })}
+                      onClick={() => onChange({ kind: "deezer-artist", id: String(a.id), name: a.name })}
                       className={`flex w-full items-center gap-3 border-b border-border/40 p-3 text-left transition-colors last:border-b-0 ${
                         active ? "bg-primary/10" : "hover:bg-surface/40"
                       }`}
                     >
-                      {a.images?.[0]?.url ? (
+                      {a.picture_medium ? (
                         <img
-                          src={a.images[0].url}
+                          src={a.picture_medium}
                           alt=""
                           className="h-12 w-12 rounded-full bg-muted object-cover"
                         />
@@ -1264,10 +1220,8 @@ function SourceStep({
                       )}
                       <div className="min-w-0 flex-1">
                         <div className="truncate font-medium">{a.name}</div>
-                        {a.genres?.length > 0 && (
-                          <div className="truncate text-xs text-muted-foreground">
-                            {a.genres.slice(0, 3).join(", ")}
-                          </div>
+                        {a.nb_album > 0 && (
+                          <div className="truncate text-xs text-muted-foreground">{a.nb_album} albums</div>
                         )}
                       </div>
                       {active && (
@@ -1283,14 +1237,113 @@ function SourceStep({
             {!artistSearching && artistQuery.trim() && artistResults.length === 0 && (
               <p className="text-sm text-muted-foreground">No artists found for "{artistQuery}".</p>
             )}
-            {source?.kind === "artist" && (
+            {source?.kind === "deezer-artist" && (
               <div className="rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
                 <span className="text-muted-foreground">Selected: </span>
                 <span className="font-medium">{source.name}</span>
-                <span className="ml-2 text-xs text-muted-foreground">— top tracks + albums (up to 150 songs)</span>
+                <span className="ml-2 text-xs text-muted-foreground">— up to 150 tracks from discography</span>
               </div>
             )}
           </TabsContent>
+
+          {/* ── Genre Tab ── */}
+          <TabsContent value="genre" className="mt-3 space-y-3">
+            <p className="text-sm text-muted-foreground">
+              Pick a genre — we'll find tracks that match your target BPM automatically.
+            </p>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+              {RUNNING_GENRES.map((g) => {
+                const active = source?.kind === "genre" && source.genreId === g.id;
+                return (
+                  <button
+                    key={g.id}
+                    onClick={() => onChange({ kind: "genre", genreId: g.id, genreName: g.name })}
+                    className={`rounded-lg border px-3 py-2.5 text-left text-sm transition-colors ${
+                      active
+                        ? "border-primary bg-primary/10 font-medium text-primary"
+                        : "border-border hover:border-primary/40 hover:bg-surface/40"
+                    }`}
+                  >
+                    {g.name}
+                  </button>
+                );
+              })}
+            </div>
+            {source?.kind === "genre" && (
+              <div className="rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
+                <span className="text-muted-foreground">Selected: </span>
+                <span className="font-medium">{source.genreName}</span>
+                <span className="ml-2 text-xs text-muted-foreground">— tracks pre-filtered by your BPM target</span>
+              </div>
+            )}
+          </TabsContent>
+
+          {/* ── Dev Library Tab (hidden behind ?dev=true) ── */}
+          {devMode && (
+            <TabsContent value="library" className="mt-3">
+              {libraryLoading && (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin text-primary" /> Loading your playlists…
+                </div>
+              )}
+              {libraryError && (
+                <div className="space-y-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive break-words font-mono">
+                  <div>{libraryError}</div>
+                  {libraryError.toLowerCase().includes("reconnect spotify") && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => { clearAuth(); window.location.href = "/"; }}
+                    >
+                      Reconnect Spotify
+                    </Button>
+                  )}
+                </div>
+              )}
+              {!libraryLoading && !libraryError && libraryLoaded && (
+                <div className="max-h-[28rem] space-y-1 overflow-y-auto rounded-lg border border-border">
+                  <button
+                    onClick={() => onChange({ kind: "liked" })}
+                    className={`flex w-full items-center gap-3 border-b border-border/40 p-3 text-left transition-colors ${
+                      isLibraryActive({ kind: "liked" }) ? "bg-primary/10" : "hover:bg-surface/40"
+                    }`}
+                  >
+                    <div className="flex h-12 w-12 items-center justify-center rounded bg-primary/20">
+                      <Music className="h-5 w-5 text-primary" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate font-medium">Liked Songs</div>
+                      <div className="truncate text-xs text-muted-foreground">Your saved tracks</div>
+                    </div>
+                  </button>
+                  {playlists.map((p) => {
+                    const active = isLibraryActive({ kind: "playlist", id: p.id, name: p.name });
+                    return (
+                      <button
+                        key={p.id}
+                        onClick={() => onChange({ kind: "playlist", id: p.id, name: p.name })}
+                        className={`flex w-full items-center gap-3 border-b border-border/40 p-3 text-left transition-colors last:border-b-0 ${
+                          active ? "bg-primary/10" : "hover:bg-surface/40"
+                        }`}
+                      >
+                        <img
+                          src={p.images?.[0]?.url ?? ""}
+                          alt=""
+                          className="h-12 w-12 rounded bg-muted object-cover"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-medium">{p.name ?? "Untitled playlist"}</div>
+                          <div className="truncate text-xs text-muted-foreground">
+                            {p.tracks?.total ?? 0} tracks{p.owner?.display_name ? ` · ${p.owner.display_name}` : ""}
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </TabsContent>
+          )}
         </Tabs>
 
         <div className="flex justify-between">
@@ -1333,7 +1386,10 @@ function GenerateStep({
   const [newPlaylistName, setNewPlaylistName] = useState("");
   const [defaultPlaylistId, setDefaultPlaylistId] = useState<string | null>(null);
 
-  const sourceLabel = source.kind === "liked" ? "Liked Songs" : source.name;
+  const sourceLabel =
+    source.kind === "liked" ? "Liked Songs"
+    : source.kind === "genre" ? source.genreName
+    : source.name;
   const isMultiSegment = segments.length > 1;
   const totalTargetMin = segments.reduce((s, seg) => s + seg.durationMin, 0);
 
@@ -1342,93 +1398,102 @@ function GenerateStep({
     (async () => {
       try {
         setPhase("loading");
-        let pool: SpotifyTrack[];
-        if (source.kind === "liked") {
-          pool = await getMyLikedTracks(1000);
-        } else if (source.kind === "playlist") {
-          pool = await getPlaylistTracks(source.id, 1000);
+
+        let trackPool: Track[];
+
+        if (source.kind === "deezer-artist") {
+          // Deezer catalog: fetch full discography with native BPM
+          trackPool = await getArtistTrackPool(source.id, 150);
+          if (cancelled) return;
+        } else if (source.kind === "genre") {
+          // Deezer BPM-filtered search: determine overall BPM range from all segments
+          const bpmMin = Math.min(...segments.map((s) => s.targetBpm - tolerance));
+          const bpmMax = Math.max(...segments.map((s) => s.targetBpm + tolerance));
+          const genre = RUNNING_GENRES.find((g) => g.id === source.genreId);
+          trackPool = await fetchTracksByBpm(
+            genre?.searchTerm ?? source.genreName.toLowerCase(),
+            Math.max(60, bpmMin),
+            Math.min(220, bpmMax),
+            75,
+          );
+          if (cancelled) return;
         } else {
-          // Artist: top tracks + albums, capped at 150.
-          // Both endpoints may be restricted for apps in Spotify development mode,
-          // so we fall back to a search query if the pool ends up empty.
-          const [topTracksResult, albumsResult] = await Promise.allSettled([
-            getArtistTopTracks(source.id),
-            getArtistAlbums(source.id),
-          ]);
-          const topTracks_ = topTracksResult.status === "fulfilled" ? (topTracksResult.value ?? []) : [];
-          const albums = albumsResult.status === "fulfilled" ? (albumsResult.value ?? []) : [];
-          if (topTracksResult.status === "rejected") {
-            console.warn("[artist] getArtistTopTracks failed:", topTracksResult.reason);
-          }
-          if (albumsResult.status === "rejected") {
-            console.warn("[artist] getArtistAlbums failed:", albumsResult.reason);
-          }
-          const seen = new Set<string>(topTracks_.map((t) => t.id));
-          const artistPool: SpotifyTrack[] = [...topTracks_];
-          for (let i = 0; i < albums.length && artistPool.length < 150; i += 5) {
-            if (cancelled) return;
-            const batch = albums.slice(i, i + 5);
-            const results = await Promise.allSettled(batch.map((a) => getAlbumTracks(a.id)));
-            for (const res of results) {
-              if (res.status !== "fulfilled") continue;
-              for (const t of res.value) {
-                if (!seen.has(t.id) && artistPool.length < 150) {
-                  seen.add(t.id);
-                  artistPool.push(t);
+          // Spotify dev sources: liked songs, playlist, or Spotify artist
+          let spotifyPool: SpotifyTrack[];
+          if (source.kind === "liked") {
+            spotifyPool = await getMyLikedTracks(1000);
+          } else if (source.kind === "playlist") {
+            spotifyPool = await getPlaylistTracks(source.id, 1000);
+          } else {
+            // source.kind === "artist" (Spotify artist — dev mode)
+            const [topTracksResult, albumsResult] = await Promise.allSettled([
+              getArtistTopTracks(source.id),
+              getArtistAlbums(source.id),
+            ]);
+            const topTracks_ = topTracksResult.status === "fulfilled" ? (topTracksResult.value ?? []) : [];
+            const albums = albumsResult.status === "fulfilled" ? (albumsResult.value ?? []) : [];
+            const seen = new Set<string>(topTracks_.map((t) => t.id));
+            const artistPool: SpotifyTrack[] = [...topTracks_];
+            for (let i = 0; i < albums.length && artistPool.length < 150; i += 5) {
+              if (cancelled) return;
+              const batch = albums.slice(i, i + 5);
+              const results = await Promise.allSettled(batch.map((a) => getAlbumTracks(a.id)));
+              for (const res of results) {
+                if (res.status !== "fulfilled") continue;
+                for (const t of res.value) {
+                  if (!seen.has(t.id) && artistPool.length < 150) {
+                    seen.add(t.id);
+                    artistPool.push(t);
+                  }
                 }
               }
             }
-          }
-          if (artistPool.length > 0) {
-            pool = artistPool;
-          } else {
-            // Artist-specific endpoints are blocked in Spotify dev mode.
-            // Run album search + two track-search queries in parallel so each
-            // query surfaces a different slice of the artist's catalog.
-            console.log("[artist] falling back to search-based pool for:", source.name);
-            const [albumTracksResult, searchResult1, searchResult2] = await Promise.allSettled([
-              searchArtistAlbums(source.name, source.id, 20).then(async (foundAlbums) => {
-                const tracks: SpotifyTrack[] = [];
-                const seenTrack = new Set<string>();
-                for (let i = 0; i < foundAlbums.length && tracks.length < 150; i += 5) {
-                  if (cancelled) return tracks;
-                  const batch = foundAlbums.slice(i, i + 5);
-                  const results = await Promise.allSettled(batch.map((a) => getAlbumTracks(a.id)));
-                  for (const res of results) {
-                    if (res.status !== "fulfilled") continue;
-                    for (const t of res.value) {
-                      // Verify this track is actually by the target artist
-                      if (!seenTrack.has(t.id) && tracks.length < 150 && t.artists?.some((a) => a.id === source.id)) {
-                        seenTrack.add(t.id);
-                        tracks.push(t);
+            if (artistPool.length > 0) {
+              spotifyPool = artistPool;
+            } else {
+              const [albumTracksResult, searchResult1, searchResult2] = await Promise.allSettled([
+                searchArtistAlbums(source.name, source.id, 20).then(async (foundAlbums) => {
+                  const tracks: SpotifyTrack[] = [];
+                  const seenTrack = new Set<string>();
+                  for (let i = 0; i < foundAlbums.length && tracks.length < 150; i += 5) {
+                    if (cancelled) return tracks;
+                    const batch = foundAlbums.slice(i, i + 5);
+                    const results = await Promise.allSettled(batch.map((a) => getAlbumTracks(a.id)));
+                    for (const res of results) {
+                      if (res.status !== "fulfilled") continue;
+                      for (const t of res.value) {
+                        if (!seenTrack.has(t.id) && tracks.length < 150 && t.artists?.some((a) => a.id === source.id)) {
+                          seenTrack.add(t.id);
+                          tracks.push(t);
+                        }
                       }
                     }
                   }
-                }
-                return tracks;
-              }),
-              // Primary name search — broad coverage
-              searchTracksByArtist(source.name, source.id, 150),
-              // Secondary query with "songs" appended — hits different Spotify index results
-              searchTracksByArtist(source.name + " songs", source.id, 100),
-            ]);
-            const combined = new Map<string, SpotifyTrack>();
-            if (albumTracksResult.status === "fulfilled") {
-              for (const t of albumTracksResult.value) combined.set(t.id, t);
+                  return tracks;
+                }),
+                searchTracksByArtist(source.name, source.id, 150),
+                searchTracksByArtist(source.name + " songs", source.id, 100),
+              ]);
+              const combined = new Map<string, SpotifyTrack>();
+              if (albumTracksResult.status === "fulfilled") for (const t of albumTracksResult.value) combined.set(t.id, t);
+              if (searchResult1.status === "fulfilled") for (const t of searchResult1.value) combined.set(t.id, t);
+              if (searchResult2.status === "fulfilled") for (const t of searchResult2.value) combined.set(t.id, t);
+              spotifyPool = Array.from(combined.values()).slice(0, 300);
             }
-            if (searchResult1.status === "fulfilled") {
-              for (const t of searchResult1.value) combined.set(t.id, t);
-            }
-            if (searchResult2.status === "fulfilled") {
-              for (const t of searchResult2.value) combined.set(t.id, t);
-            }
-            pool = Array.from(combined.values()).slice(0, 300);
           }
+          if (cancelled) return;
+          // Convert SpotifyTrack → Track (preserves spotifyUri for direct playlist saving)
+          const map = new Map<string, SpotifyTrack>();
+          spotifyPool.forEach((t) => t && map.set(t.id, t));
+          trackPool = Array.from(map.values()).map(spotifyTrackToTrack);
         }
+
         if (cancelled) return;
-        const map = new Map<string, SpotifyTrack>();
-        pool.forEach((t) => t && map.set(t.id, t));
-        const deduped = Array.from(map.values());
+        // Deduplicate by id
+        const seen = new Map<string, Track>();
+        trackPool.forEach((t) => seen.set(t.id, t));
+        const deduped = Array.from(seen.values());
+
         setProgress({ done: 0, total: deduped.length });
         setPhase("analyzing");
         const results = await analyzeTracks(deduped, (done, total) => {
@@ -1530,7 +1595,15 @@ function GenerateStep({
       const desc = isMultiSegment
         ? `${segments.map(segmentDesc).join(" → ")} · ${distStr}. Built with PaceBeat.`
         : `${distStr} @ ${segments[0].targetBpm}±${tolerance} BPM · ${formatPace((200 - segments[0].targetBpm) / 6)}. Built with PaceBeat.`;
-      const uris = picked.map((p) => p.track.uri);
+      // For Deezer sources, resolve Spotify URIs via ISRC bridge.
+      // For Spotify dev sources, use the preserved spotifyUri directly.
+      let uris: string[];
+      if (source.kind === "deezer-artist" || source.kind === "genre") {
+        const isrcs = picked.map((p) => p.track.isrc).filter((x): x is string => x !== null);
+        uris = await resolveSpotifyUrisFromIsrcs(isrcs);
+      } else {
+        uris = picked.map((p) => p.track.spotifyUri).filter((u): u is string => !!u);
+      }
 
       if (saveMode === "default") {
         const name = fixedPlaylistName;
@@ -1589,7 +1662,7 @@ function GenerateStep({
       const rows: { track: AnalyzedTrack; startMs: number; globalIdx: number }[] = [];
       for (let j = 0; j < count && trackIdx < picked.length; j++, trackIdx++) {
         rows.push({ track: picked[trackIdx], startMs: elapsedMs, globalIdx: trackIdx });
-        elapsedMs += picked[trackIdx].track.duration_ms;
+        elapsedMs += picked[trackIdx].track.durationMs;
       }
       return { seg, segStartMs, segEndMs: elapsedMs, rows };
     });
@@ -1670,7 +1743,7 @@ function GenerateStep({
                         <div key={p.track.id} className="group flex items-center gap-3 border-b border-border/40 px-3 py-2 last:border-b-0">
                           <span className="w-10 shrink-0 font-mono text-[11px] text-muted-foreground">{fmtTime(startMs)}</span>
                           <img
-                            src={p.track.album.images?.[2]?.url ?? p.track.album.images?.[0]?.url ?? ""}
+                            src={p.track.album.imageUrl ?? ""}
                             alt=""
                             className="h-9 w-9 shrink-0 rounded bg-muted object-cover"
                           />
@@ -1681,7 +1754,7 @@ function GenerateStep({
                             </div>
                           </div>
                           <span className="font-mono text-xs text-muted-foreground shrink-0">
-                            {fmtMs(p.track.duration_ms)}
+                            {fmtMs(p.track.durationMs)}
                           </span>
                           <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                             <Button
@@ -1725,7 +1798,7 @@ function GenerateStep({
                   <div key={p.track.id} className="group flex items-center gap-3 border-b border-border/40 p-2 last:border-b-0">
                     <span className="w-6 text-right font-mono text-xs text-muted-foreground">{i + 1}</span>
                     <img
-                      src={p.track.album.images?.[2]?.url ?? p.track.album.images?.[0]?.url ?? ""}
+                      src={p.track.album.imageUrl ?? ""}
                       alt=""
                       className="h-10 w-10 rounded bg-muted object-cover"
                     />

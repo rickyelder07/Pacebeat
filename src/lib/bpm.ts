@@ -1,7 +1,7 @@
 // Client-side BPM detection. Uses Deezer (by ISRC) for both tempo and a
 // playable 30s preview, since Spotify previews are now mostly null.
 import { analyze } from "web-audio-beat-detector";
-import type { SpotifyTrack } from "./spotify";
+import type { Track } from "./types";
 import { resolveTrack } from "./deezer";
 import type { RunSegment } from "./pace";
 
@@ -35,13 +35,13 @@ export async function detectBpmFromUrl(url: string): Promise<number> {
 }
 
 export interface AnalyzedTrack {
-  track: SpotifyTrack;
+  track: Track;
   bpm: number | null;
   error?: string;
 }
 
 export async function analyzeTracks(
-  tracks: SpotifyTrack[],
+  tracks: Track[],
   onProgress?: (done: number, total: number) => void,
   concurrency = 4,
 ): Promise<AnalyzedTrack[]> {
@@ -52,9 +52,17 @@ export async function analyzeTracks(
     while (i < tracks.length) {
       const idx = i++;
       const t = tracks[idx];
+      // Fast path: track already has BPM (Deezer catalog source)
+      if (t.bpm !== null && t.bpm > 0) {
+        results[idx] = { track: t, bpm: normalizeBpm(t.bpm) };
+        done++;
+        onProgress?.(done, tracks.length);
+        continue;
+      }
+      // Slow path: look up via Deezer by ISRC or title search (Spotify dev source)
       try {
         const resolved = await resolveTrack({
-          isrc: t.external_ids?.isrc ?? null,
+          isrc: t.isrc ?? null,
           artist: t.artists[0]?.name ?? "",
           title: t.name,
         });
@@ -96,7 +104,6 @@ export function pickForRun(
   targetMinutes: number,
   exclude?: Set<string>,
 ): AnalyzedTrack[] {
-  // Shuffle candidates before greedy fill so each call picks a different random subset
   const matches = analyzed
     .filter(
       (a) =>
@@ -112,13 +119,13 @@ export function pickForRun(
   for (const m of matches) {
     if (total >= targetMs) break;
     out.push(m);
-    total += m.track.duration_ms;
+    total += m.track.durationMs;
   }
   return out;
 }
 
 export function totalMinutes(tracks: AnalyzedTrack[]): number {
-  return tracks.reduce((s, a) => s + a.track.duration_ms, 0) / 60_000;
+  return tracks.reduce((s, a) => s + a.track.durationMs, 0) / 60_000;
 }
 
 export function pickForSegments(
@@ -132,7 +139,6 @@ export function pickForSegments(
   for (const seg of segments) {
     let picked = pickForRun(analyzed, seg.targetBpm, tolerance, seg.durationMin, usedIds);
     if (picked.length === 0) {
-      // Fallback: allow repeats from earlier segments when pool is too small
       picked = pickForRun(analyzed, seg.targetBpm, tolerance, seg.durationMin);
     }
     for (const t of picked) usedIds.add(t.track.id);
