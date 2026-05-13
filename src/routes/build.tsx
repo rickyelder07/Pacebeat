@@ -1,5 +1,5 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { createFileRoute } from "@tanstack/react-router";
+import { useEffect, useMemo, useState } from "react";
 import {
   computeZones,
   distanceToDurationMin,
@@ -56,8 +56,9 @@ import {
 } from "@/lib/deezer-catalog";
 import { RUNNING_GENRES } from "@/lib/deezer-genres";
 import type { Track } from "@/lib/types";
-import { useRequireAuth } from "@/hooks/use-auth";
+import { useAuthState } from "@/hooks/use-auth";
 import { SiteHeader } from "@/components/site-header";
+import { SpotifyConnectButton } from "@/components/spotify-connect";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -110,32 +111,7 @@ export type Source =
   | { kind: "genre"; genreId: number; genreName: string };
 
 function Build() {
-  const authed = useRequireAuth();
-  const navigate = useNavigate();
-  const meRequestRef = useRef(0);
   const [step, setStep] = useState<Step>("profile");
-  const [me, setMe] = useState<SpotifyUser | null>(null);
-  const [meError, setMeError] = useState<string | null>(null);
-  const [meLoading, setMeLoading] = useState(false);
-
-  const loadMe = () => {
-    const requestId = ++meRequestRef.current;
-    setMeError(null);
-    setMeLoading(true);
-    getMe()
-      .then((u) => {
-        if (meRequestRef.current !== requestId) return;
-        setMe(u);
-        setMeLoading(false);
-      })
-      .catch((e: unknown) => {
-        if (meRequestRef.current !== requestId) return;
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error("getMe failed:", msg);
-        setMeError(msg);
-        setMeLoading(false);
-      });
-  };
   const [profile, setProfile] = useState<Profile>({
     age: 32,
     weightKg: 72,
@@ -170,11 +146,6 @@ function Build() {
     rampIntensityPct: 5,
     numRaceSegments: 4,
   });
-
-  useEffect(() => {
-    if (authed && !me && !meLoading) loadMe();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authed]);
 
   const zones = useMemo(() => computeZones(profile), [profile]);
 
@@ -216,8 +187,6 @@ function Build() {
         distanceMi: 2,
       },
     ]);
-
-  if (!authed) return null;
 
   return (
     <div className="min-h-screen">
@@ -261,7 +230,7 @@ function Build() {
           )}
           {step === "source" && (
             <SourceStep
-              currentUserId={me?.id ?? null}
+              currentUserId={null}
               source={source}
               onChange={setSource}
               onBack={() => setStep("pace")}
@@ -269,9 +238,8 @@ function Build() {
             />
           )}
           {step === "generate" && (
-            segments.length > 0 && source && me ? (
+            segments.length > 0 && source ? (
               <GenerateStep
-                me={me}
                 segments={segments}
                 source={source}
                 tolerance={tolerance}
@@ -281,50 +249,15 @@ function Build() {
             ) : (
               <Card>
                 <CardHeader>
-                  <CardTitle className="font-display text-2xl">Getting ready…</CardTitle>
+                  <CardTitle className="font-display text-2xl">Almost there…</CardTitle>
                   <CardDescription>
-                    {!me
-                      ? meError
-                        ? "Couldn't load your Spotify profile."
-                        : "Loading your Spotify profile. If this takes more than a few seconds, reconnect Spotify."
-                      : segments.length === 0
+                    {segments.length === 0
                       ? "No pace selected — go back and pick one."
                       : "No music source selected — go back and pick one."}
                   </CardDescription>
                 </CardHeader>
-                <CardContent className="space-y-4">
-                  {!me && !meError && (
-                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                      <Loader2 className="h-4 w-4 animate-spin text-primary" />
-                      Connecting to Spotify…
-                    </div>
-                  )}
-                  {meError && (
-                    <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive break-words font-mono">
-                      {meError}
-                    </div>
-                  )}
-                  <div className="flex flex-wrap justify-between gap-2">
-                    <Button variant="ghost" onClick={() => setStep("source")}>Back</Button>
-                    <div className="flex gap-2">
-                      {!me && (
-                        <Button
-                          variant="outline"
-                          onClick={() => {
-                            clearAuth();
-                            navigate({ to: "/" });
-                          }}
-                        >
-                          Reconnect Spotify
-                        </Button>
-                      )}
-                      {!me && (
-                        <Button variant="hero" onClick={loadMe}>
-                          {meLoading ? "Try again" : "Retry"}
-                        </Button>
-                      )}
-                    </div>
-                  </div>
+                <CardContent>
+                  <Button variant="ghost" onClick={() => setStep("source")}>Back</Button>
                 </CardContent>
               </Card>
             )
@@ -1358,20 +1291,20 @@ function SourceStep({
 }
 
 function GenerateStep({
-  me,
   segments,
   source,
   tolerance,
   sex,
   onRestart,
 }: {
-  me: SpotifyUser;
   segments: RunSegment[];
   source: Source;
   tolerance: number;
   sex: import("@/lib/pace").Sex;
   onRestart: () => void;
 }) {
+  const { authed } = useAuthState();
+  const [me, setMe] = useState<SpotifyUser | null>(null);
   const runnerEmoji = sex === "female" ? "🏃‍♀️" : "🏃‍♂️";
   const fixedPlaylistName = `Playlist by PaceBeat ${runnerEmoji}`;
 
@@ -1582,6 +1515,16 @@ function GenerateStep({
   const save = async () => {
     setPhase("saving");
     try {
+      let currentMe = me;
+      if (!currentMe) {
+        try {
+          currentMe = await getMe();
+          setMe(currentMe);
+        } catch {
+          // Non-fatal: me is only used for owner-based playlist cleanup
+        }
+      }
+
       // Derive pace and distance from BPM targets (inverse of paceToBpm: paceMinPerKm = (200 - bpm) / 6)
       const segmentDesc = (s: RunSegment) => {
         const paceMinPerKm = (200 - s.targetBpm) / 6;
@@ -1616,7 +1559,7 @@ function GenerateStep({
         try {
           const existing = await getMyPlaylists(50);
           for (const pl of existing) {
-            if (pl.owner?.id === me.id && pl.name === name) {
+            if (pl.owner?.id === currentMe?.id && pl.name === name) {
               try { await unfollowPlaylist(pl.id); } catch { /* ignore */ }
             }
           }
@@ -1889,14 +1832,23 @@ function GenerateStep({
                 </div>
               )}
             </div>
+            {!authed && (
+              <p className="text-xs text-muted-foreground">
+                Connect Spotify to save your playlist.
+              </p>
+            )}
             <div className="flex items-center justify-between gap-3">
               <Button variant="ghost" onClick={onRestart}>Adjust pace</Button>
               <Button variant="outline" onClick={reshuffle} disabled={analyzed.length === 0}>
                 <Shuffle className="h-4 w-4" /> Reshuffle
               </Button>
-              <Button variant="hero" size="lg" onClick={save} disabled={picked.length === 0}>
-                Save to Spotify <Music className="h-4 w-4" />
-              </Button>
+              {authed ? (
+                <Button variant="hero" size="lg" onClick={save} disabled={picked.length === 0}>
+                  Save to Spotify <Music className="h-4 w-4" />
+                </Button>
+              ) : (
+                <SpotifyConnectButton />
+              )}
             </div>
           </>
         )}
@@ -1929,9 +1881,9 @@ function GenerateStep({
             <div className="space-y-3 rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm">
               <div>{errorMsg}</div>
               <div className="rounded-md border border-border/60 bg-background/70 p-3 font-mono text-xs text-muted-foreground break-all">
-                <div>Connected Spotify user: {me.display_name || "—"}</div>
-                <div>Spotify user ID: {me.id || "—"}</div>
-                <div>Spotify account email: {me.email || "(Spotify did not return one)"}</div>
+                <div>Connected Spotify user: {me?.display_name || "—"}</div>
+                <div>Spotify user ID: {me?.id || "—"}</div>
+                <div>Spotify account email: {me?.email || "(Spotify did not return one)"}</div>
                 <div>Client ID in app: {typeof window !== "undefined" ? window.localStorage.getItem("rb_spotify_client_id") ?? "—" : "—"}</div>
               </div>
             </div>

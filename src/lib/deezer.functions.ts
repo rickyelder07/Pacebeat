@@ -185,8 +185,11 @@ export const searchDeezerTracksByBpm = createServerFn({ method: "POST" })
     };
   })
   .handler(async ({ data }) => {
-    const q = data.genre;
-    const url = `https://api.deezer.com/search/track?limit=${data.limit}&q=${encodeURIComponent(q)}&bpm_min=${data.bpmMin}&bpm_max=${data.bpmMax}`;
+    // Use Deezer's genre: qualifier so results are genre-filtered rather than
+    // text-matched. Plain `q=pop` returns near-zero results because "pop" is
+    // effectively a stopword in Deezer's track/artist/album name index.
+    const q = `genre:"${data.genre}"`;
+    const url = `https://api.deezer.com/search/track?limit=${data.limit}&q=${encodeURIComponent(q)}`;
     const r = await fetchJson<{ data: DeezerFullTrack[] }>(url);
     return { tracks: r?.data ?? [] };
   });
